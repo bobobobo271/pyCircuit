@@ -1,25 +1,21 @@
 # 构建与运行
 
-以下命令从 `designs/wse_model` 执行，输出放在新建的 `.wse_model_out/` 目录中。
-本项目不附带已有构建产物、日志或测试结果。运行时生成的 JSON 回执和日志由
-脚本保存在指定输出目录，可自行检查。
+从 `designs/wse_model` 执行以下命令，每次使用新的输出目录。脚本保留各阶段
+命令、日志和 JSON 回执。源码分层后的完整机器验收仍在进行；这里给出复现
+入口，具体通过状态以相同源码、程序和产物哈希的回执为准。
 
-## 依赖
+## 依赖与环境
 
 | 用途 | 依赖 |
 | --- | --- |
 | 普通 Python 语义及测试 | Python 3.11+，`pip install -e '.[dev]'` |
-| pyCircuit 原生模型 | `models/calendar/pycircuit.lock.json` 指定的集成 checkout 与其 SDK，LLVM/MLIR 22.1.8，CMake、Ninja、C++20 编译器 |
-| Calendar Verilog | 另需 Icarus Verilog 和 VVP |
-| PTO 输入生成 | PyPTO `9339b96dd6d42e69b1dee8f43316d407887e2d43` 及其独立 Python 环境 |
-| PTO IR 处理 | PTOAS v0.72，及与其 MLIR Python 扩展匹配的 Python 环境 |
+| pyCircuit 原生模型 | `models/calendar/pycircuit.lock.json` 所指定的集成 checkout 与 SDK，LLVM/MLIR 22.1.8，CMake、Ninja、C++20 编译器 |
+| Verilog 执行 | Icarus Verilog 和 VVP |
+| PTO 输入生成 | PyPTO `9339b96dd6d42e69b1dee8f43316d407887e2d43` 及独立解释器 |
+| PTO 中间表示处理 | PTOAS v0.72，及与其 MLIR Python 扩展匹配的解释器 |
 
-pyCircuit 集成提交目前尚未发布。它包含参数循环、分析预算调整和大 Work
-拆分等本地修改，不能用本仓 `main` 编译器或单独一个上游补丁替代。
-以下原生命令的前提是已取得该集成 checkout，并从同一版本构建、安装 SDK。
-仅安装本项目的 Python 包不会安装这些外部工具。
-
-为当前 shell 设置实际路径：
+集成 SDK 与源端版本必须匹配。本机集成提交包含编译器修复，普通上游 `main`
+不自动具备同样能力；本项目不会安装这些外部工具。
 
 ```sh
 export PYCIRCUIT_ROOT=/absolute/path/to/integrated-pycircuit
@@ -28,8 +24,8 @@ export PATH="$PYC_TOOLCHAIN_ROOT/bin:$PATH"
 export PYTHONPATH="$PWD/src:$PYCIRCUIT_ROOT/python${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-同时按本机编译器环境设置 `CC`、`CXX` 和系统 SDK 路径。
-源端和工具链都应与依赖锁一致。
+同时设置实际 `CC`、`CXX` 和系统 SDK。PyPTO 与 PTOAS 使用各自匹配的解释器，
+分别设置 `AG_PYPTO_PY`、`AG_PTOAS_PY`、`AG_PTOAS_ROOT`，不混装解释器环境。
 
 ## 普通 Python
 
@@ -40,92 +36,127 @@ python -m wse_model --json run ffn-allgather
 python -m wse_model --json report matmul --m 1 --k 4096 --n 4096 --precision fp16
 ```
 
-集成测试中的外部载荷比较需要设置实际输入、输出文件路径；未提供时该项跳过。
-PyPTO 示例检查需要 `AG_PYPTO_PY` 指向独立解释器，未提供时单独跳过该示例。
-提供该变量时，集成测试会执行 PyPTO 输入编译并写入临时目录。
-普通 Python 测试不编译或运行 pyCircuit 电路。
+外部载荷比较需要实际输入、输出路径；未提供时跳过该项。PyPTO 示例检查在
+设置 `AG_PYPTO_PY` 后执行输入编译。普通 Python 测试不运行 pyCircuit 电路。
 
-## Calendar 电路
+## 共享组件回归
 
-先运行较小的接收模块，两种后端都执行：
+先执行接收接口的同一 12 周期场景，C++ 与 Verilog 使用相同最终电路：
 
 ```sh
 python tools/verify_calendar.py \
-  --pycircuit-root "$PYCIRCUIT_ROOT" \
+  --pycircuit-root "$PYCIRCUIT_ROOT" --toolchain "$PYC_TOOLCHAIN_ROOT" \
+  --suite receive --target both --output "$PWD/.wse_model_out/receive"
+```
+
+同一入口还保留 `route`、`forward`、`control`、`node`、`multinode`、
+`capacity-positive` 和 `capacity-exhausted`。各 suite 的条件、周期与独立
+检查记录在回执中。容量耗尽是预期失败案例，须比较指定的已发布观测前缀。
+
+旧 `allgather`、`allgather-control`、`allgather-delayed` 原生入口已撤下。
+对应源和规范保留在 `verification/fixtures/calendar/`，仅作历史场景和静态
+reference 回归。新 AllGather 功能验证统一使用通用机器。
+
+## 规范追溯
+
+项目根 `ndf.yaml`、`ndf.lock` 固定 NDF 0.2 工具依赖，并将共享组件规范和
+`spec/programmed-machine.md` 纳入同一个项目。按锁文件取得、构建外部工具，
+放在 `.pycircuit_out/ndf`，再运行：
+
+```sh
+pycircuit spec-check . --ndf .pycircuit_out/ndf/target/release/ndf \
+  --output "$PWD/.wse_model_out/project-spec"
+```
+
+`models/calendar` 的独立追溯入口只检查组件。它自己的依赖位置为
+`models/calendar/.pycircuit_out/ndf`，可以指向同一锁定 checkout；准备好该路径后
+可单独对 `models/calendar` 执行 spec-check。组件检查通过不替代项目根检查。
+
+当前条款全部为 draft。追溯 PASS 说明规范身份与实际 Python 定义绑定正确；
+行为验证与批准状态另在回执中记录。源码更新后，应重新执行对应追溯检查。
+
+## 构建一次通用机器
+
+默认单任务构建 C++ runner，优化为 O1；添加 `--emit-verilog` 从同一个
+final ACIR 生成 RTL（寄存器传输级表示）：
+
+```sh
+python tools/build_wse_machine.py \
+  --emit-verilog --output "$PWD/.wse_model_out/machine-build"
+```
+
+构建回执记录共享组件、机器和driver的源码哈希、工具链及各阶段退出状态。
+编译、链接、后端生成、宿主构建和执行分别判断；生成 RTL 本身不等于已运行。
+程序、稀疏内存初始化和读回范围都是运行时文件，格式见
+[program-interface.md](docs/program-interface.md)。
+
+驱动回执的 `timing.phases` 分别记录复位、内存加载、程序加载、启动、执行、
+读回及账户检查所用的宿主秒数、周期数和 Step 次数。每个宿主周期仍执行低、
+高两个半拍，检查条件保持一致。`execution_cycles` 表示模型执行周期，宿主
+秒数表示模拟器运行开销；比较性能时须固定程序、输入、硬件配置、编译优化
+等级和构建并行度。`driver_seconds_before_receipt` 还包含输入解析与输出写入，
+计时止于回执 `timing` 字段生成处，包含此前回执前缀的准备与写入。
+
+## 同硬件程序验证
+
+C++ 测试入口加载独立指定的程序，并比较字节、接收账户和许可变化：
+
+```sh
+python tools/verify_wse_machine.py \
+  --simulator "$PWD/.wse_model_out/machine-build/build/wse_runner" \
+  --output "$PWD/.wse_model_out/machine-cpp"
+```
+
+树形场景覆盖分支、只转发节点和节点 33；许可控制固定程序与数据，只撤去一个
+远端目的在 offset=8 时的三拍许可，比较保持状态、输出及周期增量。重复身份
+场景检查目标数据和计数保持。每个案例使用同一个已构建runner。
+
+RTL 适配器从同一build目录读取final ACIR、Verilog及端口信息，以运行时输入
+驱动生成硬件；独立预期仍在host：
+
+```sh
+python tools/verify_machine_rtl.py \
+  --build "$PWD/.wse_model_out/machine-build" \
   --toolchain "$PYC_TOOLCHAIN_ROOT" \
-  --suite receive --target both \
-  --output "$PWD/.wse_model_out/receive"
+  --output "$PWD/.wse_model_out/machine-rtl"
 ```
 
-完整闭环的入口为 `allgather-control` 和 `allgather-delayed`：
+源码变化后，旧build的来源检查会失效，应重新构建，不能替换回执中的hash来
+复用旧结果。
 
-```sh
-ulimit -s 65520
-python tools/verify_calendar.py \
-  --pycircuit-root "$PYCIRCUIT_ROOT" \
-  --toolchain "$PYC_TOOLCHAIN_ROOT" \
-  --suite allgather-control --target cpp --cpp-opt-level 0 \
-  --timeout 21600 --stack-kib 65520 \
-  --output "$PWD/.wse_model_out/allgather-control"
-```
+## 实际 PTO 数据链
 
-`--stack-kib` 检查继承栈上限，不负责修改；上面的 `ulimit` 受系统 hard limit
-约束，应先确认系统允许该值。
-
-完整闭环的源码链接与构建开销较大。生成 RTL 的 CMake 入口调用 SDK helper
-时仍使用其 180 秒默认限制；大模型可在保留同一生成 RTL 的情况下，直接调用
-现有 helper 的较长时限。把 `RTL_PROJECT` 设为生成的 Verilog 目录：
-
-```sh
-python "$PYC_TOOLCHAIN_ROOT/share/pycircuit/cmake/verify_example.py" \
-  --compile-system "$RTL_PROJECT" \
-  --output "$PWD/.wse_model_out/rtl/pycircuit_sim" \
-  --include "$PYC_TOOLCHAIN_ROOT/include" \
-  --iverilog "$(command -v iverilog)" --vvp "$(command -v vvp)" --timeout 21600
-```
-
-该命令只构建仿真程序。完整功能比较仍由 `tools/verify_calendar.py` 及
-`models/calendar/host_checks.py` 中的检查负责。
-
-## PTO 实际载荷
-
-构建一次载荷模拟器，默认生成 C++，编译优化为 O1、单编译任务：
-
-```sh
-python tools/build_pto_allgather.py \
-  --output "$PWD/.wse_model_out/payload-build"
-```
-
-PyPTO 与 PTOAS 分别使用匹配的解释器，不要把它们混装到本项目环境中。
-设置 `AG_PYPTO_PY`、`AG_PTOAS_PY` 和 `AG_PTOAS_ROOT` 为各自的实际路径后执行：
+设置独立工具环境后执行：
 
 ```sh
 python tools/run_pto_allgather.py \
-  --pypto-python "$AG_PYPTO_PY" \
-  --ptoas-python "$AG_PTOAS_PY" \
+  --pypto-python "$AG_PYPTO_PY" --ptoas-python "$AG_PTOAS_PY" \
   --ptoas-root "$AG_PTOAS_ROOT" \
-  --simulator "$PWD/.wse_model_out/payload-build/build/payload_runner" \
-  --output "$PWD/.wse_model_out/payload-run"
+  --simulator "$PWD/.wse_model_out/machine-build/build/wse_runner" \
+  --output "$PWD/.wse_model_out/pto-machine-run"
 ```
 
-运行器重新生成并处理 PTO IR，生成运行时描述符，执行不同输入和许可条件，
-逐字节检查所有节点的真实输出。工作负载在运行时输入，不嵌入生成的电路源码。
+该入口重新生成 PyPTO 输入、处理 PTOAS 中间表示、验证传输与同步、生成通用
+程序，再运行真实字节读写。输出逐字节与原始输入及算法定义比较。PTO基线的
+512个COPY与包含配置、接收、等待和退休的完整指令数分开记录。
 
-## 暂定时序模型
+## 专项时序分析
 
-先构建独立时序模拟器，再将它交给同一整链入口：
+`models/pto_allgather/timing.py`、`timing_driver.cpp`、`timing_profile.json`
+保留原路径，作为 analysis-only 的行列专项投影。相关入口为
+`build_pto_allgather_timing.py`、`analyze_pto_allgather_timing.py` 和
+`verify_pto_allgather_timing.py`。它们按对应工作负载和receipt版本单独验证，
+不提供通用机器的实际字节输出。完成 PTO 数据链后，可独立执行：
 
 ```sh
 python tools/build_pto_allgather_timing.py \
   --output "$PWD/.wse_model_out/timing-build"
-python tools/run_pto_allgather.py \
-  --pypto-python "$AG_PYPTO_PY" \
-  --ptoas-python "$AG_PTOAS_PY" \
-  --ptoas-root "$AG_PTOAS_ROOT" \
-  --simulator "$PWD/.wse_model_out/payload-build/build/payload_runner" \
-  --timing-simulator "$PWD/.wse_model_out/timing-build/build/timing_runner" \
-  --output "$PWD/.wse_model_out/payload-timing-run"
+python tools/verify_pto_allgather_timing.py \
+  --compiler-dir "$PWD/.wse_model_out/pto-machine-run/baseline-32/compiler" \
+  --functional-verification "$PWD/.wse_model_out/pto-machine-run/verification.json" \
+  --simulator "$PWD/.wse_model_out/timing-build/build/timing_runner" \
+  --output "$PWD/.wse_model_out/timing-verification"
 ```
 
-`models/pto_allgather/timing_profile.json` 提供显式参数；其中的暂定项保持
-`pending`。功能模型的串行执行周期和时序模型的 NoC 周期分别记录。
+暂定参数保持 `pending`。通用机器串行步数、时序投影的片上网络周期与真实
+硬件测量分别报告；复用功能证据前还须校验相同程序和产物身份。

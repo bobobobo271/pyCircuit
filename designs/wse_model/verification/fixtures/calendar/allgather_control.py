@@ -8,11 +8,11 @@ its identity and relies on the existing receive de-duplication semantics.
 """
 
 import pycircuit as ac
-from wse_calendar.allgather import Transfer, hop_rows, line_input, path_reached, route_rows
 from wse_calendar.control import CalRegAdmission, CalRegRequest, EpochBank, EpochRequest
 from wse_calendar.forward import ForwardHop, HopResult
 from wse_calendar.receive import ReceiveEngine, Request, Segment
 from wse_calendar.route import DecodeEntry, RouteRegisters
+from wse_calendar_fixture.allgather import Transfer, hop_rows, line_input, path_reached, route_rows
 
 
 @ac.struct
@@ -94,7 +94,7 @@ def controlled_transfer(
     )
 
 
-# ndf: implements=WSEMIG-CLOSEDLOOP-MEMBER-001
+# Historical NDF reference: implements=WSEMIG-CLOSEDLOOP-MEMBER-001
 @ac.module
 def ControlledMember(
     command: Command, hops: ac.table[8, HopResult], *, NODE: int
@@ -285,7 +285,7 @@ def feedback_rows(
     return rows
 
 
-# ndf: implements=WSEMIG-CLOSEDLOOP-001
+# Historical NDF reference: implements=WSEMIG-CLOSEDLOOP-001
 @ac.module
 def ControlledAllGather(carrier: CarrierInput):
     stage: ac.u3 = 0

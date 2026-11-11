@@ -7,6 +7,11 @@ owner: wse-calendar
 
 # Completion-driven multi-node Calendar control
 
+This document describes the historical metadata fixture in
+`verification/fixtures/calendar/`; its clauses do not define WseMachine.
+The legacy native suite is no longer registered. Static/reference regression
+remains in the AllGather reference unit tests.
+
 ## Member control and receive state {#WSEMIG-CLOSEDLOOP-MEMBER-001}
 <!-- ndf: kind=requirement modality=must refinement=L2 domain=noc status=draft refines=WSEMIG-RX-REQ-001 -->
 

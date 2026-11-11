@@ -196,7 +196,7 @@ def path_reached(hops: ac.table[8, HopResult], transfer: Transfer, target: ac.u3
     return reached
 
 
-# ndf: implements=WSEMIG-ALLGATHER-001
+# Historical NDF reference: implements=WSEMIG-ALLGATHER-001
 @ac.module
 def AllGatherMember(transfer: Transfer, hops: ac.table[8, HopResult], node: ac.u6):
     rank = node[3:6] if transfer.key_id == 1 else node[0:3]

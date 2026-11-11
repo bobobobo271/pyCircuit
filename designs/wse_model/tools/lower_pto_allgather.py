@@ -408,11 +408,23 @@ def main():
     descriptors = lower_calendar(program, transfers)
     binary = b"".join(descriptor.pack() for descriptor in descriptors)
     (directory / "commands.bin").write_bytes(binary)
+    # The 48-byte fragments remain algorithm-side timing inputs. Only the
+    # separate, algorithm-neutral 64-byte instruction stream drives hardware.
+    from wse_model.programs.allgather import compile_allgather
+
+    machine_program = compile_allgather(program, descriptors)
+    machine_binary = machine_program.pack()
+    (directory / "machine.bin").write_bytes(machine_binary)
+    (directory / "machine-program.json").write_text(
+        json.dumps(machine_program.manifest(), indent=2) + "\n"
+    )
     receipt = {
         "status": "PASS",
         "analysis": analysis,
         "descriptors": len(descriptors),
         "commands_sha256": hashlib.sha256(binary).hexdigest(),
+        "machine_program_sha256": hashlib.sha256(machine_binary).hexdigest(),
+        "machine_instructions": len(machine_program.commands),
     }
     # Static workload accounting: payload byte-hops, with no invented link latency.
     traffic = []

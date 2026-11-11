@@ -54,9 +54,16 @@ def lower_calendar(program: dict, transfers: list[list[dict]]) -> list[Descripto
     """
     if program["schema"] != "wse-pypto-allgather/1":
         raise ValueError("unsupported program schema")
-    if program["topology"] != [5, 8] or program["members"] != list(range(32)):
-        raise ValueError("this executable profile requires the 40-node/32-member carrier")
-    if program["bank_bytes"] != 65536 or len(program["phases"]) != 2:
+    if program["topology"] != [5, 8]:
+        raise ValueError("this route encoding uses the 40-node carrier")
+    members = program["members"]
+    if (
+        not members
+        or members != sorted(set(members))
+        or any(not 0 <= node < 40 for node in members)
+    ):
+        raise ValueError("members must be distinct nodes in the 40-node route space")
+    if not 0 < program["bank_bytes"] <= 65536 or len(program["phases"]) != 2:
         raise ValueError("unsupported memory or phase profile")
     phases = program["phases"]
     if phases[1]["source_base"] != phases[0]["target_base"]:
@@ -75,8 +82,11 @@ def lower_calendar(program: dict, transfers: list[list[dict]]) -> list[Descripto
     descriptors = []
     for phase_id, (phase, copies) in enumerate(zip(phases, transfers, strict=True)):
         ranks, words = phase["ranks"], phase["words"]
-        if (ranks, words, phase["fragments"]) != ((8, 384, 8), (4, 3072, 8))[phase_id]:
+        fragments = phase["fragments"]
+        if not 1 <= ranks <= 40 or words <= 0 or fragments <= 0:
             raise ValueError("unsupported executable geometry")
+        if words * 4 % fragments or (words * 4 // fragments) % 8:
+            raise ValueError("fragments must partition the source into aligned 8B beats")
         if phase["dtype"] != "f32" or phase["layout"] != "rank-major-contiguous":
             raise ValueError("expected contiguous FP32 rank-major storage")
         if phase["input_shape"] != [1, words] or phase["output_shape"] != [ranks, words]:
@@ -95,13 +105,10 @@ def lower_calendar(program: dict, transfers: list[list[dict]]) -> list[Descripto
         if copies != expected_copies:
             raise ValueError("PTOAS transfers do not implement the declared rank-ordered AllGather")
         groups = phase["groups"]
-        expected_groups = (
-            [list(range(r * 8, r * 8 + 8)) for r in range(4)]
-            if phase_id == 0
-            else [list(range(c, 32, 8)) for c in range(8)]
-        )
-        if groups != expected_groups:
-            raise ValueError("group ordering must preserve the source rank order")
+        if any(len(group) != ranks for group in groups):
+            raise ValueError("group size disagrees with the PTO rank count")
+        if sorted(node for group in groups for node in group) != members:
+            raise ValueError("each phase must partition the declared participants")
         logical_bytes = words * 4
         geometry = PayloadGeometry(1, logical_bytes, logical_bytes, 1, ranks * logical_bytes)
         geometry.check_source_alignment()
@@ -113,25 +120,25 @@ def lower_calendar(program: dict, transfers: list[list[dict]]) -> list[Descripto
         )
         arena.validate_fill()
         src_start, dst_start = phase["source_base"], phase["target_base"]
-        if (src_start, dst_start) != ((0, 4096), (4096, 16384))[phase_id]:
-            raise ValueError("unsupported executable address profile")
-        if not (0 <= src_start < src_start + logical_bytes <= 65536):
+        if src_start % 8 or dst_start % 8:
+            raise ValueError("source and target addresses must be 8B aligned")
+        if not (0 <= src_start < src_start + logical_bytes <= program["bank_bytes"]):
             raise ValueError("source range exceeds the modeled bank")
-        if not (0 <= dst_start < dst_start + geometry.capacity <= 65536):
+        if not (0 <= dst_start < dst_start + geometry.capacity <= program["bank_bytes"]):
             raise ValueError("target range exceeds the modeled bank")
         if max(src_start, dst_start) < min(
             src_start + logical_bytes, dst_start + geometry.capacity
         ):
             raise ValueError("source and target buffers overlap")
-        for source in range(32):
+        for source in members:
             group = next(tuple(group) for group in groups if source in group)
             rank = group.index(source)
             route = group_allgather_bitmap(topology, group, source)
             trace = simulate_multicast(topology, route, source=source)
-            if set(trace.land_nodes) != set(group) - {source}:
+            if not trace.is_clean_tree_walk or set(trace.land_nodes) != set(group) - {source}:
                 raise ValueError("Calendar route does not reach the transfer destinations")
-            fragment_bytes = logical_bytes // 8
-            for fragment in range(8):
+            fragment_bytes = logical_bytes // fragments
+            for fragment in range(fragments):
                 descriptors.append(
                     Descriptor(
                         phase_id,

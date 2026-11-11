@@ -6,7 +6,7 @@ and its own members' feedback, never a scheduled phase or scheduled completion.
 """
 
 import pycircuit as ac
-from wse_calendar.allgather_control import CarrierInput, ControlledAllGather
+from wse_calendar_fixture.allgather_control import CarrierInput, ControlledAllGather
 
 
 @ac.system

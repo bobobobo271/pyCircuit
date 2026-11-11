@@ -26,7 +26,7 @@ def main():
         wrong_signal = re.sub(
             r"(pto\.comm\.tnotify\(%[\w-]+, )%c1_i32", r"\1%c-1_i32", original, count=1
         )
-        narrow_tile = re.sub(r"(valid_col = )%c(?:384|3072)\b", r"\1%c1", original, count=1)
+        narrow_tile = re.sub(rf"(valid_col = )%c{phase['words']}\b", r"\1%c1", original, count=1)
         wrong_context = original.replace("pto.load %arg4[", "pto.load %arg3[")
         no_pipe_flags = re.sub(
             r"^\s*pto\.(?:set|wait)_flag\[.*\]\s*$", "", original, flags=re.MULTILINE

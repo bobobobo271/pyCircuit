@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 
 from analyze_pto_allgather_timing import load_workload
-from run_pto_allgather import digest, run, verify_build
+from machine_common import digest, run, verify_build
 
 from wse_model.analysis.allgather_schedule import prepare_timing
 
@@ -52,21 +52,30 @@ def main():
         if args.functional_verification:
             previous = json.loads(args.functional_verification.read_text())
             root = args.functional_verification.resolve().parent
-            if (
-                previous["status"] != "PASS"
-                or binary != (root / "compiler/commands.bin").read_bytes()
-            ):
-                raise ValueError("functional evidence does not cover the same workload")
+            if previous["status"] != "PASS":
+                raise ValueError("functional verification did not pass")
+            matches = [
+                workload
+                for workload in previous["workloads"]
+                if binary == (root / workload["name"] / "compiler/commands.bin").read_bytes()
+            ]
+            if len(matches) != 1:
+                raise ValueError("functional evidence does not identify the same workload")
+            workload = matches[0]
             verify_build(Path(previous["build"]["receipt"]["runner"]))
-            for case in previous["runs"]:
-                for field, file in (("input_sha256", "input.bin"), ("output_sha256", "output.bin")):
-                    if digest(root / case["case"] / file) != case[field]:
-                        raise ValueError("functional artifact changed after verification")
+            for case in workload["runs"]:
+                directory = root / workload["name"] / case["case"]
+                for name, expected in case["inputs"].items():
+                    if digest(directory / name) != expected:
+                        raise ValueError("functional input changed after verification")
+                if digest(directory / "output.bin") != case["output_sha256"]:
+                    raise ValueError("functional output changed after verification")
             receipt["functional_evidence"] = {
                 "path": str(args.functional_verification.resolve()),
                 "sha256": digest(args.functional_verification),
-                "status": "REUSED_SAME_WORKLOAD_AND_PAYLOAD_SIMULATOR",
-                "cases": [case["case"] for case in previous["runs"]],
+                "status": "REUSED_SAME_WORKLOAD_AND_GENERIC_MACHINE",
+                "workload": workload["name"],
+                "cases": [case["case"] for case in workload["runs"]],
             }
         cases = (
             ("baseline", {}, None),

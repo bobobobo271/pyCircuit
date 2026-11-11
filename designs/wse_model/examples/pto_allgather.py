@@ -34,13 +34,38 @@ def allgather_kernel(ranks: int, words: int):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--rows", type=int, default=4)
+    parser.add_argument("--cols", type=int, default=8)
+    parser.add_argument("--words", type=int, default=384)
+    parser.add_argument("--fragments", type=int, default=8)
+    parser.add_argument("--source-base", type=int, default=0)
+    parser.add_argument("--row-base", type=int, default=4096)
+    parser.add_argument("--output-base", type=int, default=16384)
     args = parser.parse_args()
+    if not 1 <= args.rows <= 5 or not 1 <= args.cols <= 8:
+        parser.error("groups must fit the explicit 5x8 topology")
+    if args.words <= 0 or args.fragments <= 0 or args.words * 4 % (8 * args.fragments):
+        parser.error("source words must partition into aligned 8B fragments")
     args.output.mkdir(parents=True, exist_ok=True)
     backend.set_backend_type(BackendType.Ascend910)
     phases = []
     for name, ranks, words, groups, source_base, target_base in (
-        ("row", 8, 384, [list(range(r * 8, r * 8 + 8)) for r in range(4)], 0, 4096),
-        ("column", 4, 3072, [list(range(c, 32, 8)) for c in range(8)], 4096, 16384),
+        (
+            "row",
+            args.cols,
+            args.words,
+            [list(range(r * 8, r * 8 + args.cols)) for r in range(args.rows)],
+            args.source_base,
+            args.row_base,
+        ),
+        (
+            "column",
+            args.rows,
+            args.cols * args.words,
+            [list(range(c, args.rows * 8, 8)) for c in range(args.cols)],
+            args.row_base,
+            args.output_base,
+        ),
     ):
         program = allgather_kernel(ranks, words)
         lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program)
@@ -57,7 +82,7 @@ def main() -> None:
                 "groups": groups,
                 "source_base": source_base,
                 "target_base": target_base,
-                "fragments": 8,
+                "fragments": args.fragments,
                 "input_shape": [1, words],
                 "output_shape": [ranks, words],
                 "layout": "rank-major-contiguous",
@@ -67,14 +92,14 @@ def main() -> None:
     manifest = {
         "schema": "wse-pypto-allgather/1",
         "topology": [5, 8],
-        "members": list(range(32)),
+        "members": [r * 8 + c for r in range(args.rows) for c in range(args.cols)],
         "bank_bytes": 65536,
         "phases": phases,
         "dependency": {
             "producer": "row.target",
             "consumer": "column.source",
             "view": "contiguous-flatten",
-            "bytes": 12288,
+            "bytes": args.cols * args.words * 4,
         },
         "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
     }

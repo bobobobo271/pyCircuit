@@ -7,6 +7,11 @@ owner: wse-calendar
 
 # FFN two-phase functional AllGather
 
+This document describes the historical metadata fixture in
+`verification/fixtures/calendar/`; its clauses do not define WseMachine.
+The legacy native suite is no longer registered. Static/reference regression
+remains in the AllGather reference unit tests.
+
 ## Resident accounts and routed delivery {#WSEMIG-ALLGATHER-001}
 <!-- ndf: kind=requirement modality=must refinement=L2 domain=noc status=draft refines=WSEMIG-RX-REQ-001 -->
 
@@ -35,4 +40,5 @@ and 2, and source sequence numbers 0..7 followed by 8..15.
 The host MUST check every node's routing and receive observations at both
 sampling points per cycle against validated core routes, simulate_multicast
 and ReceiveAccount. Expected observations MUST remain outside compiled sources.
-Execution status and toolchain identity are recorded by tools/verify_calendar.py.
+Historical execution receipts retain their original candidate identity.
+Current static checks use tests/unit/test_allgather_reference.py.

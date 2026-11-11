@@ -8,8 +8,8 @@ Run 516 cycles: post, 256 row segments, retire, then repeat for the column phase
 """
 
 import pycircuit as ac
-from wse_calendar.allgather import AllGatherMember, hop_rows, line_input, transfer_for
 from wse_calendar.forward import ForwardHop
+from wse_calendar_fixture.allgather import AllGatherMember, hop_rows, line_input, transfer_for
 
 
 @ac.system
