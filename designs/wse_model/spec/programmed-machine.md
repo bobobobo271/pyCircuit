@@ -17,7 +17,7 @@ its sampling and adoption order. Epoch and configuration wrappers MUST call the
 same state-owning cores used by the machine.
 
 The machine is a bounded functional profile: 40 logical node banks, 64 KiB per
-bank, 8-byte beats, one fragment in flight, one resident receive context per
+bank, up to 64-byte beats (8-byte fallback for short or non-64-byte-aligned transfers), one fragment in flight, one resident receive context per
 node, two early metadata slots and 56 identity slots. Internal time multiplexing
 MUST preserve node isolation and transaction semantics. It assigns no physical
 shared-memory topology or port performance.

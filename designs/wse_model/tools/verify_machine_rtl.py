@@ -23,12 +23,13 @@ HOST_FIELDS = (
     ("kind", 3),
     ("node", 6),
     ("address", 32),
-    ("data", 64),
+    ("wide", 1),
+    ("data", 512),
     ("program_count", 16),
     ("landing_permit", 40),
 )
 RESULT_FIELDS = (
-    ("data", 64),
+    ("data", 512),
     ("pc", 16),
     ("stage", 5),
     ("selected_node", 6),
@@ -67,7 +68,7 @@ def pack_host(**values: int) -> str:
         if not 0 <= part < 1 << width:
             raise ValueError(f"host field {name} exceeds {width} bits")
         value = (value << width) | part
-    return f"{value:041x}"
+    return f"{value:0153x}"
 
 
 def ports_contract(path: Path) -> tuple[dict, dict, dict]:
@@ -86,8 +87,8 @@ def testbench(host: dict, result: dict, domains: dict, root_name: str) -> str:
     """One runtime-file adapter, with no case-specific constants or expectations."""
     declarations, connections = [], []
     for wire, width in (
-        (host["wire"], 161),
-        (result["wire"], 311),
+        (host["wire"], 610),
+        (result["wire"], 759),
         (domains["clock"], 1),
         (domains["reset"], 1),
     ):
@@ -113,13 +114,13 @@ def testbench(host: dict, result: dict, domains: dict, root_name: str) -> str:
 module tb;
 @DECLARATIONS@
 @ROOT@ dut(@CONNECTIONS@);
-logic [310:0] sampled;
+logic [758:0] sampled;
 @ALIASES@
 string load_path, query_path;
 integer load_file, query_file, scanned, instructions, bound, max_cycles;
 integer stall_pc=-1, stall_cycles=0, stalled=0, execution_cycles=0;
 bit stall_started=0, withdrawing=0, raw_probe=0;
-logic [160:0] command, probe_request;
+logic [609:0] command, probe_request;
 logic [39:0] permits;
 task work_commit;
 begin
@@ -135,7 +136,7 @@ begin
   pyc_root_commit_ok=1;pyc_phase=2;#1;pyc_phase=0;pyc_root_commit_ok=0;#1;
 end
 endtask
-task cycle(input logic [160:0] request);
+task cycle(input logic [609:0] request);
 begin
   @HOST@=request;@CLOCK@=0;#1;work_commit();
   @CLOCK@=1;#1;work_commit();
@@ -162,10 +163,10 @@ initial begin
   if(raw_probe)begin
     cycle(probe_request);
     if(!observed_fault)$fatal(1,"invalid raw host request did not set fault");
-    cycle({3'd0,6'd0,32'd0,64'd0,16'd0,40'hffffffffff});
+    cycle({3'd0,6'd0,32'd0,1'b0,512'd0,16'd0,40'hffffffffff});
     if(!observed_fault)$fatal(1,"ordinary host fault was not sticky");
   end else begin
-    cycle({3'd3,6'd0,32'd0,64'd0, instructions[15:0],40'hffffffffff});
+    cycle({3'd3,6'd0,32'd0,1'b0,512'd0, instructions[15:0],40'hffffffffff});
   end
   for(bound=0;bound<max_cycles && !observed_done && !observed_fault;bound=bound+1)begin
     permits=40'hffffffffff;
@@ -178,7 +179,7 @@ initial begin
         observed_selected_node,observed_offset,observed_read_bytes,observed_write_bytes,observed_counted);
       stalled=stalled+1;
     end
-    cycle({3'd0,6'd33,32'd0,64'd0,16'd0,permits});
+    cycle({3'd0,6'd33,32'd0,1'b0,512'd0,16'd0,permits});
     execution_cycles=execution_cycles+1;
   end
   if(!observed_done && !observed_fault)$fatal(1,"execution cycle bound exhausted");
@@ -191,9 +192,9 @@ initial begin
     if(scanned==1)begin
       cycle(command);
       if(raw_probe && !observed_fault)$fatal(1,"fault lost during diagnostic readback");
-      if(command[160:158]==4)$display("READ %h",observed_data);
-      else if(command[160:158]==5)$display("ACCOUNT %0d %0d %0d %0d %0d %0d",
-        command[157:152],observed_counted,observed_active,observed_complete,observed_pending,observed_epoch);
+      if(command[609:607]==4)$display("READ %h",observed_data);
+      else if(command[609:607]==5)$display("ACCOUNT %0d %0d %0d %0d %0d %0d",
+        command[606:601],observed_counted,observed_active,observed_complete,observed_pending,observed_epoch);
       else $fatal(1,"unsupported observation request");
     end else if(!$feof(query_file))$fatal(1,"malformed query record");
   end
@@ -353,7 +354,9 @@ def main() -> None:
             "seen_slots": 56,
             "early_slots": 2,
             "bank_bytes": 65536,
-            "beat_bytes": 8,
+            "beat_bytes": 64,
+            "narrow_beat_bytes": 8,
+            "host_interface_version": 2,
             "max_cycles": args.max_cycles,
             "timeout_seconds": args.timeout,
             "backend": "iverilog",
@@ -404,7 +407,9 @@ def main() -> None:
         required = {
             "nodes": 40,
             "bank_bytes": 65536,
-            "beat_bytes": 8,
+            "beat_bytes": 64,
+            "narrow_beat_bytes": 8,
+            "host_interface_version": 2,
             "early_slots": 2,
             "seen_slots": 56,
             "max_commands": 1024,

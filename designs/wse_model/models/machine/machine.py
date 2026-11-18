@@ -47,10 +47,10 @@ RAM/NoC timing. Runtime programs can address only node-local ranges.
 # 1 取指/控制：安装配置、推进轮次、POST、WAIT、RETIRE、END，或启动 COPY。
 # 2 路由：逐节点遍历路径，检查连通树，收集所有远端目的。
 # 3 预检：扫描 40 个节点，确认目的接收范围、轮次、容量和身份。
-# 4 读：从源内存取 8 字节，保存到 payload。
+# 4 读：从源内存取最多 64 字节，保存到 payload。
 # 5 写：把同一份 payload 逐个写到目的；本拍结束再读下一拍。
 # 6 完成：允许宿主读回结果。7 故障：停止正常推进，允许诊断读回。
-# “一个数据拍”在这里就是一次处理的 8 字节，不等于真实网络的传输粒度。
+# “一个数据拍”在这里就是一次处理的 64 字节（短片段或非 64 字节对齐时为 8 字节），不等于真实网络的传输粒度。
 #
 # 具体例子：把节点 0 的 16 字节复制到节点 1，不包含源本地副本。
 # 程序先为相关节点安装类别、推进轮次，并 POST 节点 1 的 16 字节接收账户。
@@ -71,7 +71,7 @@ from wse_calendar.ledger import ReceiveLedger, Request, Segment
 # 宿主到机器的请求接口。字段组合是硬件输入，不是文件路径。
 # kind：0 无宿主操作；1 写数据；2 写程序的一段；3 启动；4 读数据。
 # 当前分支也允许 kind=5，但它没有独立处理分支，会继续按 stage 执行。
-# node/address：节点编号与节点内字节地址；data：每次送入的 64 位数据。
+# node/address：节点编号与节点内字节地址；data：512 位数据；wide=True 传 64 字节，否则低 64 位传 8 字节。
 # program_count：启动时指定实际指令条数，允许 1..1024。
 # landing_permit：40 位目的写入许可，第 n 位控制节点 n 的远端落点许可。
 # 它供暂停/背压测试使用，不代表宿主提前提供待搬运的数据。
@@ -80,7 +80,8 @@ class HostRequest:
     kind: ac.u3
     node: ac.u6
     address: ac.u32
-    data: ac.u64
+    wide: bool
+    data: ac.bits[512]
     program_count: ac.u16
     landing_permit: ac.bits[40]
 
@@ -93,7 +94,7 @@ class HostRequest:
 # 这些字段用于功能检查；累计字节与执行周期须分别解读。
 @ac.struct
 class MachineResult:
-    data: ac.u64
+    data: ac.bits[512]
     pc: ac.u16
     stage: ac.u5
     selected_node: ac.u6
@@ -197,35 +198,44 @@ class ReadAddress:
 
 # 40 个节点各 65536 字节，总计 2621440 字节。
 # 逻辑上节点独占各自区域；实现上把它们放进一份字节存储，方便功能仿真。
-# 读/写类型 ac.u64 意味着每次处理 8 字节，但 depth 和地址仍以字节计。
+# 读/写类型 ac.bits[512] 意味着端口宽度为 64 字节，但 depth 和地址仍以字节计。
 # 例如节点 1 的地址 16，对应底层地址 1*65536+16。
+# 读操作对齐到 64 字节边界，再选出请求起始字节；窄写用字节掩码保留邻居。
 # 共享服务方式是此功能实现的选择，不用来推断真实芯片存储端口拓扑。
 @ac.module
-def BankedMemory(request: ReadAddress) -> ac.u64:
-    memory = ac.byte_mem[ac.u64](depth=2621440)
+def BankedMemory(request: ReadAddress) -> ac.bits[512]:
+    memory = ac.byte_mem[ac.bits[512]](depth=2621440)
 
     # 自主读规则：检查节点、8 字节对齐、末地址不超过 65528。
     # 65528+8=65536，恰好读到节点区域末尾。u22 足以表示整份内存地址。
     # 左移 16 位等于乘 65536，随后加节点内地址得到底层字节地址。
     @ac.rule
-    def load() -> ac.u64:
+    def load() -> ac.bits[512]:
         assert (
             request.node < 40 and request.address <= 65528 and request.address[0:3] == 0
         ), "node-local read range"
         bank: ac.u22 = request.node
         local: ac.u22 = request.address[0:22]
-        return memory.read((bank << 16) + local)
+        aligned = local & 4194240
+        shift: ac.u9 = request.address[0:6]
+        return memory.read((bank << 16) + aligned) >> (shift * 8)
 
     # 可调用写方法：与读规则使用相同地址布局。None 表示没有数据返回。
     # write 的实际写入随调用者事务提交；遇到断言失败不会只提交一部分效果。
     @ac.method
-    def write(node: ac.u6, address: ac.u32, data: ac.u64) -> None:
+    def write(node: ac.u6, address: ac.u32, data: ac.bits[512], wide: bool) -> None:
         assert node < 40 and address <= 65528 and address[0:3] == 0, "node-local write range"
         bank: ac.u22 = node
         local: ac.u22 = address[0:22]
-        memory.write((bank << 16) + local, data)
+        assert not wide or address[0:6] == 0, "wide write alignment"
+        mask: ac.u64 = 18446744073709551615 if wide else 255
+        memory.write((bank << 16) + local, data, mask=mask)
 
     return load
+
+
+def transfer_size(source: ac.u32, target: ac.u32, remaining: ac.u32) -> ac.u32:
+    return 64 if source[0:6] == 0 and target[0:6] == 0 and remaining >= 64 else 8
 
 
 # ndf: implements=WSEMIG-MACHINE-SHARED-001,WSEMIG-MACHINE-PROGRAM-001
@@ -234,7 +244,7 @@ def BankedMemory(request: ReadAddress) -> ac.u64:
 @ac.module
 def WseMachine(host: HostRequest) -> MachineResult:
     # 程序内存：65536 字节 / 每条 64 字节 = 最多 1024 条指令。
-    # 读一次得到整条 512 位指令；宿主装载时每次只写其中 8 字节。
+    # 读一次得到整条 512 位指令；宿主可一次写整条 64 字节，也支持 8 字节窄写。
     program = ac.byte_mem[ac.bits[512]](depth=65536)
     # 实例化子模块会给当前机器创建独立的状态。
     # ReceiveLedger 保存 40 个接收账户、80 个早到元数据槽、2240 个去重身份槽。
@@ -253,7 +263,7 @@ def WseMachine(host: HostRequest) -> MachineResult:
     # stage=2..5 的拆分让载荷和遍历进度能跨模型周期保存。
     stage: ac.u5 = 0
     # selected：路由遍历、预检查或数据写入当前处理哪个节点。
-    # offset：当前 COPY 内已经走到的源/目的字节偏移，每个数据拍增加 8。
+    # offset：当前 COPY 内已经走到的源/目的字节偏移，每个数据拍增加 beat_bytes（64 或 8）。
     # current：保存已取出的整条指令，供后续多个阶段使用。
     selected: ac.u6 = 0
     offset: ac.u32 = 0
@@ -263,9 +273,9 @@ def WseMachine(host: HostRequest) -> MachineResult:
     # active_nodes：仍持有接收上下文的节点；END 要求它为空。
     # frontier：已发现但还没访问的路由节点；visited：已经访问的路由节点。
     # targets：本次 COPY 要落地的节点；remote_mask：最终远端目标的固定集合。
-    # beat_remaining：本个 8 字节拍还没写到的目标，会逐个清除。
+    # beat_remaining：本个数据拍还没写到的目标，会逐个清除。
     # parents：记录路由遍历的来路，转发时排除父节点，避免立即沿原路返回。
-    # payload：把源读出的 8 字节存到跨周期状态，供后续多个目的写入复用。
+    # payload：把源读出的最多 64 字节存到跨周期状态，供后续多个目的写入复用。
     active_nodes: ac.u40 = 0
     frontier: ac.u40 = 0
     visited: ac.u40 = 0
@@ -273,18 +283,21 @@ def WseMachine(host: HostRequest) -> MachineResult:
     remote_mask: ac.u40 = 0
     beat_remaining: ac.u40 = 0
     parents = ac.table[40, ac.u6](init=0)
-    payload: ac.u64 = 0
+    payload: ac.bits[512] = 0
     # 故障码：1 宿主请求，2 指令格式/程序越界，3 配置安装，4 推进轮次，
     # 5 接收/配置/轮次匹配，6 路由，7 COPY 参数，9 END 时接收账户仍活跃。
     # 这是本模型的诊断编码。出现故障后 stage=7，供宿主读回定位。
     fault_code: ac.u8 = 0
     read_bytes: ac.u64 = 0
     write_bytes: ac.u64 = 0
+    # 源/目的与偏移在一拍所有落点完成前保持不变，因此拍长由当前状态直接确定。
+    beat_bytes = transfer_size(current.src + offset, current.dst + offset, current.nbytes - offset)
     # 普通表达式绑定是由输入和状态算出的条件，没有再分配一份持久状态。
     # 宿主仅能在空闲、完成或故障时读内存，防止和执行期的源读取争用接口。
     # 无效节点的观测选择先回退到节点 0，最终返回处再屏蔽无效观测。
     host_node_valid = host.node < 40
     host_address_valid = host.address <= 65528 and host.address[0:3] == 0
+    host_address_valid = host_address_valid and (not host.wide or host.address[0:6] == 0)
     host_read_window = stage == 0 or stage == 6 or stage == 7
     host_read = host.kind == 4 and host_node_valid and host_address_valid and host_read_window
     observation_node = host.node if host_node_valid else 0
@@ -327,24 +340,23 @@ def WseMachine(host: HostRequest) -> MachineResult:
         ):
             fault_code = 1
             stage = 7
-        # 宿主写数据：只在 stage=0 允许。每条请求写节点内的 8 字节。
+        # 宿主写数据：只在 stage=0 允许。每条请求写节点内的 64 或 8 字节。
         # 这用于初始化载荷，属于运行准备，不是 COPY 路由执行。
         elif host.kind == 1:
             if stage != 0 or not host_in_range:
                 fault_code = 1
                 stage = 7
             else:
-                memory.write(host.node, host.address, host.data)
-        # 宿主写程序：每次送 64 位，底层程序存储的写端口宽度为 512 位。
-        # mask=255（二进制低八位为 1）只更新从该字节地址开始的 8 个字节通道，
-        # 所以宿主用连续八次请求装好一条 64 字节指令。
+                memory.write(host.node, host.address, host.data, host.wide)
+        # 宿主写程序：宽请求一次装好 64 字节；窄请求只更新低八个字节通道。
         elif host.kind == 2:
-            if stage != 0 or host.address > 65528 or host.address[0:3] != 0:
+            if stage != 0 or not host_address_valid:
                 fault_code = 1
                 stage = 7
             else:
                 word: ac.bits[512] = host.data
-                program.write(host.address[0:16], word, mask=255)
+                program_mask: ac.u64 = 18446744073709551615 if host.wide else 255
+                program.write(host.address[0:16], word, mask=program_mask)
         # 宿主启动：保存实际指令数并进入取指阶段。本 A 实现仅从初始空闲启动；
         # pc 的初值是 0。完成后重新开始另一程序的方式由外部驱动复位处理。
         elif host.kind == 3:
@@ -639,12 +651,13 @@ def WseMachine(host: HostRequest) -> MachineResult:
                         stage = 4
                 else:
                     selected = selected + 1
-        # 阶段 4：从 current.src+offset 读源节点的 8 字节，并保存到 payload。
+        # 阶段 4：从 current.src+offset 读源节点的最多 64 字节，并保存到 payload。
         # 把全部目标复制到 beat_remaining，下一阶段逐个写同一份数据。
         # 因此多播在此功能实现中是“读一次，串行写多个目的”。
         elif stage == 4:
             payload = memory
-            read_bytes = read_bytes + 8
+            read_increment: ac.u64 = beat_bytes
+            read_bytes = read_bytes + read_increment
             beat_remaining = targets
             selected = first_node(targets)
             stage = 5
@@ -653,32 +666,34 @@ def WseMachine(host: HostRequest) -> MachineResult:
         # 这是对固定远端集合的检查，已写过的目标也仍在本拍许可集合里。
         elif stage == 5:
             if (host.landing_permit & remote_mask) == remote_mask:
-                memory.write(selected, current.dst + offset, payload)
-                write_bytes = write_bytes + 8
-                # 只有该目的最后一个 8 字节拍才提交整片段的身份与字节计数。
+                memory.write(selected, current.dst + offset, payload, beat_bytes == 64)
+                write_increment: ac.u64 = beat_bytes
+                write_bytes = write_bytes + write_increment
+                # 只有该目的最后一个数据拍才提交整片段的身份与字节计数。
                 # 数据末拍写入和 ledger.commit 处于同一事务，成功后一起可见。
                 # 本地源副本跳过远端账本。断言要求预检成功的独占接收只被计数一次。
-                if offset + 8 == current.nbytes and selected != current.source[0:6]:
+                if offset + beat_bytes == current.nbytes and selected != current.source[0:6]:
                     committed = ledger.commit(selected, segment_of(current))
                     assert committed == 2, "exclusive prepared receive commits once"
                 # 写完一个目的清掉其位：还有目的就换 selected；本拍全写完后，
-                # 若整个片段也结束则 pc+1 回 stage=1，否则 offset+8 回 stage=4 读下一拍。
+                # 若整个片段也结束则 pc+1 回 stage=1，否则 offset+beat_bytes 回 stage=4 读下一拍。
                 beat_remaining = beat_remaining & ~(one << selected)
                 if beat_remaining != 0:
                     selected = first_node(beat_remaining)
-                elif offset + 8 == current.nbytes:
+                elif offset + beat_bytes == current.nbytes:
                     pc = pc + 1
                     stage = 1
                 else:
-                    offset = offset + 8
+                    offset = offset + beat_bytes
                     stage = 4
 
         # 汇总观测输出。默认 data=0，合法宿主读才返回存储输出。
         # 账本观测选择 host.node，而不是 selected，因此宿主可指定要看哪个接收账户。
         # 这里是按 Rule 内当前计算值形成的输出；持久更新仍由事务提交控制。
-        data: ac.u64 = 0
+        data: ac.bits[512] = 0
         if host_read:
-            data = memory
+            narrow_data: ac.bits[512] = memory[0:64]
+            data = memory if host.wide else narrow_data
         account = ledger.observe(observation_node)
         account_epoch = ledger.epoch_of(observation_node)
         return MachineResult(

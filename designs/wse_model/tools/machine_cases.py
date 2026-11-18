@@ -2,7 +2,7 @@
 
 The byte strings and routes below are test-owned constants. No result is
 computed by the hardware model or the AllGather program generator. All cases
-use the same 40-node, 64 KiB-per-node hardware profile and an 8-byte beat.
+use the same 40-node, 64 KiB-per-node hardware profile.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ class MachineCase:
     expected_counts: dict[int, int]
     stall_copy_pc: int | None = None
     expect_fault: bool = False
+    expected_traffic: tuple[int, int] | None = None
 
 
 def _setup(nodes: tuple[int, ...]) -> list[Command]:
@@ -200,6 +201,46 @@ def disconnected_route() -> MachineCase:
     )
 
 
+def copy_72_bytes(name: str, src: int, dst: int, *, trailing_guard: bytes) -> MachineCase:
+    # Adjacent nodes 38 -> 39: source participates, target participates and lands.
+    payload = bytes(range(1, 73))
+    guard_size = len(SENTINEL) + len(payload) + len(trailing_guard)
+    commands = _setup((38, 39)) + [
+        _post(39, dst, 72, 72),
+        Command(
+            Kind.COPY,
+            opcode=1,
+            epoch=1,
+            source=38,
+            src=src,
+            dst=dst,
+            nbytes=72,
+            route=(2 << 76) | (3 << 78),
+        ),
+    ]
+    return MachineCase(
+        name=name,
+        program=Program(tuple(commands + _finish((39,)))),
+        patches=(
+            MemoryPatch(38, src, payload),
+            MemoryPatch(39, dst - 8, SENTINEL * (guard_size // 8)),
+        ),
+        readback=(MemoryRegion(39, dst - 8, guard_size),),
+        expected_bytes=SENTINEL + payload + trailing_guard,
+        expected_counts={39: 72},
+        expected_traffic=(72, 72),
+    )
+
+
 def cases() -> dict[str, MachineCase]:
-    result = (changed_group_allgather(), tree_copy_duplicate(), bad_range(), disconnected_route())
+    result = (
+        changed_group_allgather(),
+        tree_copy_duplicate(),
+        bad_range(),
+        disconnected_route(),
+        # One 8-byte beat followed by a 64-byte beat ending exactly at 65536.
+        copy_72_bytes("bank-end-mixed-width", 65464, 65464, trailing_guard=b""),
+        # Different residues modulo 64 force nine 8-byte beats.
+        copy_72_bytes("different-alignment", 256, 520, trailing_guard=SENTINEL),
+    )
     return {case.name: case for case in result}

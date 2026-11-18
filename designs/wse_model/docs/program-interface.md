@@ -1,8 +1,8 @@
 # WSE 功能模型的运行时程序接口
 
 本接口用于把通信程序加载到同一套 WSE 功能模型，不是新增真实 WSE 指令集。
-硬件 profile 显式指定 40 节点的 5×8 拓扑、每节点 65536 字节存储、8 字节
-数据拍、8 位轮次、一个在途片段，每节点早到槽 2 个、去重身份槽 56 个。
+硬件 profile 显式指定 40 节点的 5×8 拓扑、每节点 65536 字节存储、最多 64 字节
+数据拍（短片段或未按 64 字节对齐时为 8 字节）、8 位轮次、一个在途片段，每节点早到槽 2 个、去重身份槽 56 个。
 程序清单必须与这份已编译配置完全一致；修改容量需要重新构建硬件。程序决定参与者、路由、
 地址、长度、期望接收量和操作顺序。
 
@@ -57,13 +57,13 @@ COPY 完成，排除重复身份与源自身，不随逐目标完成而缩小。
 
 ## 宿主与状态接口
 
-`HostRequest` 按声明顺序包含 kind:u3、node:u6、address:u32、data:u64、
+`HostRequest` 按声明顺序包含 kind:u3、node:u6、address:u32、wide:bool、data:bits512、
 program_count:u16、landing_permit:bits40。
 kind=0 空闲，1 写节点内存，2 写程序内存，3 启动，4 读节点内存，5 观察节点。
-加载只允许 idle；读回允许 idle、done 和锁存的普通 fault。程序以 8 字节拍
+加载只允许 idle；读回允许 idle、done 和锁存的普通 fault。程序以 64 字节宽拍或 8 字节窄拍
 加载，start 的 program_count 取程序实际指令条数。非法请求锁存普通 fault；kind 6、7 未定义。
 
-`MachineResult` 按声明顺序包含 data:u64、pc:u16、stage:u5、selected_node:u6、
+`MachineResult` 按声明顺序包含 data:bits512、pc:u16、stage:u5、selected_node:u6、
 offset:u32、counted:u32、active:bool、complete:bool、pending:u8、epoch:u8、fault:bool、
 fault_code:u8、done:bool、read_bytes:u64、write_bytes:u64。
 读回与账户观察的节点由 host.node 选择；selected_node 是硬件当前处理的节点，
@@ -91,3 +91,16 @@ epoch 是所观察账户保留的轮次。
 
 该裸记录格式固定为接口版本 1，由构建回执与程序清单声明。记录本身不含
 版本头；加载器和驱动须使用相同接口版本，不能宣称从裸字节自动识别版本。
+
+## 512 位功能数据端口
+
+宿主信号接口版本为 2，`data` 宽度为 512 位，`wide` 字段位于 `data` 前。
+宽请求一次传输 64 字节，要求地址按 64 字节对齐；窄请求通过低 64 位传输
+8 字节，要求地址按 8 字节对齐。指令、镜像及读回文件仍使用原 ABI 版本 1。
+`MachineProfile.beat_bytes=8` 表示文件格式的最小传输粒度和对齐要求。
+
+COPY 在源、目的当前地址都按 64 字节对齐且剩余长度不少于 64 字节时使用宽拍，
+其他情况使用窄拍。因此源、目的地址模 64 不同时，该段始终走窄拍。
+存储读取先向下对齐到节点内的 64 字节边界；写入从请求字节地址开始，
+字节掩码保护邻居数据。流量按有效字节计数，接收账本在最后一拍提交。
+这里的拍数用于功能仿真，不是物理片上网络的 flit 周期数。

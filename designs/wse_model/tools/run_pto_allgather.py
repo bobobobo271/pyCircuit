@@ -92,6 +92,10 @@ def main():
     parser.add_argument("--ptoas-root", type=Path, required=True)
     parser.add_argument("--simulator", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--profile", choices=("baseline-32", "variant-4"))
+    parser.add_argument(
+        "--baseline-only", action="store_true", help="Run only seed-1 without permit stalls"
+    )
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -133,6 +137,8 @@ def main():
             ),
         )
         for label, parameters in profiles:
+            if args.profile and label != args.profile:
+                continue
             directory = output / label
             compiler, manifest, program, stages = compile_workload(args, directory, parameters)
             workload = {"name": label, "parameters": parameters, "stages": stages, "runs": []}
@@ -150,11 +156,22 @@ def main():
                 if c.kind == Kind.COPY and c.nbytes >= 16
             )
             remote = next(node for node in range(40) if (copy.route >> (2 * node)) & 1)
+            beat_bytes = receipt["build"]["receipt"]["profile"]["beat_bytes"]
+            if (
+                copy.src % beat_bytes == 0
+                and copy.dst % beat_bytes == 0
+                and copy.nbytes >= beat_bytes
+            ):
+                stall_offset = beat_bytes if copy.nbytes > beat_bytes else 0
+            else:
+                stall_offset = 8
             for name, seed, stall in (
                 ("baseline", 1, None),
                 ("new-data", 7, None),
-                ("stall", 1, {"pc": copy_pc, "node": remote, "offset": 8, "cycles": 3}),
+                ("stall", 1, {"pc": copy_pc, "node": remote, "offset": stall_offset, "cycles": 3}),
             ):
+                if args.baseline_only and name != "baseline":
+                    continue
                 patches, ranges, expected = inputs(manifest, seed)
                 result = execute_program(
                     simulator, program, patches, ranges, directory / name, stall=stall
@@ -184,6 +201,11 @@ def main():
                 )
                 save()
                 print(f"{label}/{name}: PASS", flush=True)
+            if args.baseline_only:
+                workload["status"] = "PASS"
+                workload["control_comparison"] = "NOT RUN (baseline only)"
+                save()
+                continue
             baseline, changed, stalled = workload["runs"]
             cycles = [r["simulation"]["execution_cycles"] for r in workload["runs"]]
             if cycles[1] != cycles[0] or cycles[2] != cycles[0] + 3:
@@ -212,7 +234,7 @@ def main():
             "execution": "serialized-functional",
             "hardware_nodes": 40,
             "bank_bytes_per_node": 65536,
-            "payload_beat_bytes": 8,
+            "payload_beat_bytes": receipt["build"]["receipt"]["profile"]["beat_bytes"],
             "workers": 1,
             "changed_workload_fields": ["members", "length", "addresses", "data", "program"],
             "controlled_fields": ["final ACIR", "simulator binary", "device capacities"],

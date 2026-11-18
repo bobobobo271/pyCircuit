@@ -14,13 +14,20 @@ def check_case(case, result: dict) -> None:
     actual = Path(result["output"]).read_bytes()
     if actual != case.expected_bytes:
         raise AssertionError(f"{case.name}: actual node memory differs from literal byte oracle")
-    observed = result["simulation"]["accounts"]
+    simulation = result["simulation"]
+    observed = simulation["accounts"]
     for node, expected in case.expected_counts.items():
         samples = [entry for entry in observed if entry["node"] == node]
         if not samples or any(entry["counted"] != expected for entry in samples):
             raise AssertionError(f"{case.name}: node {node} receive count differs from {expected}")
-    if case.expect_fault and result["simulation"]["destination_write_bytes"] != 0:
+    if case.expect_fault and simulation["destination_write_bytes"] != 0:
         raise AssertionError("range preflight failure wrote payload before rejecting")
+    if case.expected_traffic is not None:
+        traffic = (simulation["source_read_bytes"], simulation["destination_write_bytes"])
+        if traffic != case.expected_traffic:
+            raise AssertionError(
+                f"{case.name}: byte traffic {traffic} differs from {case.expected_traffic}"
+            )
 
 
 # ndf: verifies=WSEMIG-MACHINE-VER-001
@@ -42,6 +49,7 @@ def main() -> None:
     try:
         available = cases()
         selected = args.case or list(available)
+        execution_cycles = {}
         for name in selected:
             case = available[name]
             result = execute_program(
@@ -53,6 +61,7 @@ def main() -> None:
                 expect_fault=case.expect_fault,
             )
             check_case(case, result)
+            execution_cycles[name] = result["simulation"]["execution_cycles"]
             receipt["runs"].append({"case": name, "status": "PASS", **result})
             save()
             print(name + ": PASS", flush=True)
@@ -85,6 +94,14 @@ def main() -> None:
                     )
                 receipt["runs"].append({"case": "tree-stalled", "status": "PASS", **stalled})
                 save()
+        if {"bank-end-mixed-width", "different-alignment"} <= execution_cycles.keys():
+            # Same command sequence, route and byte count. Each additional data
+            # beat adds one read cycle and one write cycle for this single target.
+            delta = (
+                execution_cycles["different-alignment"] - execution_cycles["bank-end-mixed-width"]
+            )
+            if delta != 2 * (9 - 2):
+                raise AssertionError(f"nine narrow beats must take 14 more cycles; got {delta}")
         if {entry["simulator_sha256"] for entry in receipt["runs"]} != {
             receipt["build"]["receipt"]["runner_sha256"]
         }:

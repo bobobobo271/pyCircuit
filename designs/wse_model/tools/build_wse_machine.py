@@ -67,7 +67,9 @@ def main() -> int:
         "profile": {
             "nodes": 40,
             "bank_bytes": 65536,
-            "beat_bytes": 8,
+            "beat_bytes": 64,
+            "narrow_beat_bytes": 8,
+            "host_interface_version": 2,
             "early_slots": 2,
             "seen_slots": 56,
             "max_commands": 1024,

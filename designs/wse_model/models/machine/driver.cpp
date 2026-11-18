@@ -1,4 +1,6 @@
 #include "pycircuit_system.hpp"
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -9,7 +11,10 @@
 #include <vector>
 
 namespace fs = std::filesystem;
-constexpr unsigned kNodes = 40, kBankBytes = 65536, kBeat = 8, kInstruction = 64;
+using Clock = std::chrono::steady_clock;
+constexpr unsigned kNodes = 40, kBankBytes = 65536, kAlignment = 8;
+constexpr unsigned kBeat = 64, kInstruction = 64;
+using Beat = std::array<std::uint8_t, kBeat>;
 
 static void require(bool condition, const std::string &message) {
   if (!condition) throw std::runtime_error(message);
@@ -34,18 +39,24 @@ struct Region { unsigned node, address, bytes; };
 static Region region(const std::vector<std::uint8_t> &data, std::size_t offset) {
   Region result{unsigned(little(data, offset, 4)), unsigned(little(data, offset + 4, 4)),
                 unsigned(little(data, offset + 8, 4))};
-  require(result.node < kNodes && result.address % kBeat == 0 &&
-          result.bytes > 0 && result.bytes % kBeat == 0 &&
+  require(result.node < kNodes && result.address % kAlignment == 0 &&
+          result.bytes > 0 && result.bytes % kAlignment == 0 &&
           std::uint64_t(result.address) + result.bytes <= kBankBytes,
           "invalid host node-local memory range");
   return result;
 }
+static unsigned transfer_bytes(unsigned address, unsigned remaining) {
+  return address % kBeat == 0 && remaining >= kBeat ? kBeat : kAlignment;
+}
 struct Request {
   unsigned kind = 0, node = 0, address = 0, count = 0;
-  std::uint64_t data = 0, permits = (std::uint64_t(1) << kNodes) - 1;
+  bool wide = false;
+  Beat data{};
+  std::uint64_t permits = (std::uint64_t(1) << kNodes) - 1;
 };
 struct Snapshot {
-  std::uint64_t data = 0, reads = 0, writes = 0;
+  Beat data{};
+  std::uint64_t reads = 0, writes = 0;
   unsigned pc = 0, stage = 0, node = 0, offset = 0, counted = 0;
   unsigned pending = 0, epoch = 0, fault_code = 0;
   bool active = false, complete = false, fault = false, done = false;
@@ -56,14 +67,17 @@ struct Simulation {
   std::uint64_t cycles = 0, steps = 0;
 
   static auto pack(const Request &request) {
-    gfsim::Bits<161> bits{};
+    gfsim::Bits<610> bits{};
     auto put = [&](unsigned offset, unsigned width, std::uint64_t value) {
       for (unsigned bit = 0; bit < width; ++bit)
         if ((value >> bit) & 1) bits = gfsim::detail::setBit(bits, offset + bit);
     };
-    put(0, 40, request.permits); put(40, 16, request.count); put(56, 64, request.data);
-    put(120, 32, request.address); put(152, 6, request.node); put(158, 3, request.kind);
-    return gfsim::FourState<161>::known(bits);
+    put(0, 40, request.permits); put(40, 16, request.count);
+    for (unsigned byte = 0; byte < (request.wide ? kBeat : kAlignment); ++byte)
+      put(56 + 8 * byte, 8, request.data[byte]);
+    put(568, 1, request.wide); put(569, 32, request.address);
+    put(601, 6, request.node); put(607, 3, request.kind);
+    return gfsim::FourState<610>::known(bits);
   }
   void drive(const Request &request, unsigned clock) {
     inputs.host = decltype(inputs.host)::fromPacked(pack(request));
@@ -89,8 +103,8 @@ struct Simulation {
     auto get = [&](unsigned offset, unsigned width) {
       std::uint64_t value = 0;
       for (unsigned bit = 0; bit < width; ++bit) {
-        require(bits.knownMask().bit(offset + bit) && !bits.zMask().bit(offset + bit),
-                "unknown machine observation");
+        if (!bits.knownMask().bit(offset + bit) || bits.zMask().bit(offset + bit))
+          throw std::runtime_error("unknown machine observation");
         value |= std::uint64_t(bits.value().bit(offset + bit)) << bit;
       }
       return value;
@@ -100,7 +114,9 @@ struct Simulation {
     out.fault_code = get(129, 8); out.fault = get(137, 1); out.epoch = get(138, 8);
     out.pending = get(146, 8); out.complete = get(154, 1); out.active = get(155, 1);
     out.counted = get(156, 32); out.offset = get(188, 32); out.node = get(220, 6);
-    out.stage = get(226, 5); out.pc = get(231, 16); out.data = get(247, 64);
+    out.stage = get(226, 5); out.pc = get(231, 16);
+    for (unsigned byte = 0; byte < kBeat; ++byte)
+      out.data[byte] = get(247 + 8 * byte, 8);
     return out;
   }
   Snapshot cycle(const Request &request) {
@@ -123,7 +139,6 @@ static void write_bytes(const fs::path &path, const std::vector<std::uint8_t> &b
 }
 
 int main(int argc, char **argv) {
-  using Clock = std::chrono::steady_clock;
   const auto driver_started = Clock::now();
   fs::path receipt;
   bool may_write_receipt = false;
@@ -159,32 +174,53 @@ int main(int argc, char **argv) {
     };
     std::vector<Phase> phases;
     auto phase_started = Clock::now();
+    auto next_progress = phase_started + std::chrono::seconds(30);
     std::uint64_t phase_cycles = 0, phase_steps = 0;
     Simulation simulation;
     auto finish_phase = [&](const char *name) {
       const auto finished = Clock::now();
       phases.push_back({name, std::chrono::duration<double>(finished - phase_started).count(),
                         simulation.cycles - phase_cycles, simulation.steps - phase_steps});
+      const auto &phase = phases.back();
+      std::cerr << "PHASE complete " << phase.name << " seconds=" << phase.seconds
+                << " host_cycles=" << phase.cycles << " steps=" << phase.steps << '\n';
       phase_cycles = simulation.cycles;
       phase_steps = simulation.steps;
       phase_started = Clock::now();
+    };
+    auto progress = [&](const char *name, const Snapshot &state) {
+      const auto now = Clock::now();
+      if (now < next_progress) return;
+      std::cerr << "PROGRESS phase=" << name
+                << " seconds=" << std::chrono::duration<double>(now - phase_started).count()
+                << " host_cycles=" << simulation.cycles - phase_cycles << " pc=" << state.pc
+                << " stage=" << state.stage << " offset=" << state.offset << '\n';
+      next_progress = now + std::chrono::seconds(30);
     };
     finish_phase("build_reset");
     for (std::size_t offset = 0; offset < image.size();) {
       Region patch = region(image, offset); offset += 12;
       require(offset + patch.bytes <= image.size(), "truncated image payload");
-      for (unsigned beat = 0; beat < patch.bytes; beat += kBeat) {
+      for (unsigned beat = 0; beat < patch.bytes;) {
         Request request; request.kind = 1; request.node = patch.node;
-        request.address = patch.address + beat; request.data = little(image, offset + beat, 8);
-        require(!simulation.cycle(request).fault, "machine rejected image load");
+        request.address = patch.address + beat;
+        const unsigned size = transfer_bytes(request.address, patch.bytes - beat);
+        request.wide = size == kBeat;
+        std::copy_n(image.begin() + offset + beat, size, request.data.begin());
+        const auto observed = simulation.cycle(request);
+        require(!observed.fault, "machine rejected image load");
+        progress("image_load", observed);
+        beat += size;
       }
       offset += patch.bytes;
     }
     finish_phase("image_load");
     for (unsigned offset = 0; offset < program.size(); offset += kBeat) {
-      Request request; request.kind = 2; request.address = offset;
-      request.data = little(program, offset, 8);
-      require(!simulation.cycle(request).fault, "machine rejected program load");
+      Request request; request.kind = 2; request.address = offset; request.wide = true;
+      std::copy_n(program.begin() + offset, kBeat, request.data.begin());
+      const auto observed = simulation.cycle(request);
+      require(!observed.fault, "machine rejected program load");
+      progress("program_load", observed);
     }
     finish_phase("program_load");
     Request start; start.kind = 3; start.count = program.size() / kInstruction;
@@ -202,9 +238,7 @@ int main(int argc, char **argv) {
         stall_samples.push_back(state); ++stalled;
       }
       state = simulation.cycle(request);
-      if (simulation.cycles % 65536 == 0)
-        std::cerr << "PROGRESS cycles=" << simulation.cycles << " pc=" << state.pc
-                  << " stage=" << state.stage << " offset=" << state.offset << '\n';
+      progress("execution", state);
     }
     require(state.done || state.fault, "machine exceeded explicit execution bound");
     require(stall_pc < 0 || stalled == unsigned(stall_cycles), "requested stall was not reached");
@@ -216,15 +250,19 @@ int main(int argc, char **argv) {
     std::vector<Region> requested;
     for (std::size_t offset = 0; offset < ranges.size(); offset += 12) {
       Region range = region(ranges, offset); requested.push_back(range);
-      for (unsigned beat = 0; beat < range.bytes; beat += kBeat) {
+      for (unsigned beat = 0; beat < range.bytes;) {
         Request request; request.kind = 4; request.node = range.node;
         request.address = range.address + beat;
+        const unsigned size = transfer_bytes(request.address, range.bytes - beat);
+        request.wide = size == kBeat;
         auto observed = simulation.cycle(request);
-        for (unsigned byte = 0; byte < kBeat; ++byte)
-          bytes.push_back((observed.data >> (8 * byte)) & 255);
+        bytes.insert(bytes.end(), observed.data.begin(), observed.data.begin() + size);
+        progress("readback_and_accounts", observed);
+        beat += size;
       }
       Request observe; observe.kind = 5; observe.node = range.node;
       accounts.push_back(simulation.cycle(observe));
+      progress("readback_and_accounts", accounts.back());
     }
     finish_phase("readback_and_accounts");
     fs::path written = output;
@@ -233,6 +271,8 @@ int main(int argc, char **argv) {
     std::ofstream report(receipt); require(bool(report), "cannot create receipt");
     report << "{\n  \"status\":\"" << (execution.fault ? "FAULT" : "EXECUTED")
            << "\",\n  \"abi_version\":1,\n  \"workers\":1,\n  \"backend\":\"cpp\",\n"
+           << "  \"host_beat_bytes\":" << kBeat
+           << ",\n  \"data_beat_bytes\":" << kBeat << ",\n"
            << "  \"instructions\":" << program.size() / kInstruction
            << ",\n  \"execution_cycles\":" << execution_cycles
            << ",\n  \"pc\":" << execution.pc << ",\n  \"stage\":" << execution.stage
