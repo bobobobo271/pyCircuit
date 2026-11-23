@@ -120,6 +120,30 @@ class Decision:
     total: ac.u32
 
 
+# 比较一组八个身份。每个身份低 16 位是 seq，高 6 位是 source。
+def matching_octet(row: ac.bits[176], valid: ac.u8, identity: ac.bits[22]) -> bool:
+    pair = ac.concat(identity, identity)
+    four = ac.concat(pair, pair)
+    diff = row ^ ac.concat(four, four)
+    # 将每个身份的 22 个差异位（16 + 4 + 2）归约到该身份的最低位。
+    two = diff | (diff >> 1)
+    four_bits = two | (two >> 2)
+    eight = four_bits | (four_bits >> 4)
+    sixteen = eight | (eight >> 8)
+    mismatches = sixteen | (four_bits >> 16) | (two >> 20)
+    lanes = ac.concat(
+        mismatches[154:155],
+        mismatches[132:133],
+        mismatches[110:111],
+        mismatches[88:89],
+        mismatches[66:67],
+        mismatches[44:45],
+        mismatches[22:23],
+        mismatches[0:1],
+    )
+    return ((~lanes) & valid) != 0
+
+
 # 这些关键字参数是编译时常量，决定硬件表的规模，不是运行时输入信号。
 # NODES：节点数；EARLY_SLOTS/SEEN_SLOTS：每节点的早到/去重槽数。
 # TOTAL_*：对应表的总项数；ROW_BITS：一节点去重身份行的位数。
@@ -262,24 +286,30 @@ def ReceiveLedger(
         require_node(node)
         account = accounts[node % NODES]
         status: ac.u4 = 0
-        duplicate = False
-        free = False
-        slot: ac.u8 = 0
         validity = seen_valid[node % NODES]
         identities = identity_rows[node % NODES]
-        # 固定循环检查该节点的全部槽：validity 的第 i 位决定身份 i 是否有效。
-        # duplicate 一旦置位就保留；free 只记录第一个空槽，后面的空槽不会覆盖 slot。
+        # 按槽号顺序选择第一个空槽，保留原来的四态选择行为。
+        free = False
+        slot: ac.u8 = 0
         for index in range(SEEN_SLOTS):
-            wide_index_2: ac.u16 = index
-            offset: ac.u16 = wide_index_2 * 22
-            shifted = identities >> offset
-            entry = shifted[0:22]
-            entry_valid = (validity >> wide_index_2) & 1 != 0
-            if entry_valid and entry[16:22] == segment.source and entry[0:16] == segment.seq:
-                duplicate = True
+            slot_index: ac.u16 = index
+            entry_valid = (validity >> slot_index) & 1 != 0
             if not entry_valid and not free:
                 free = True
                 slot = index
+        # 尾组可能不足八槽，补齐位的有效标记为零。
+        identity = ac.concat(segment.source, segment.seq)
+        row_padding: ac.bits[176] = 0
+        valid_padding: ac.u8 = 0
+        padded_rows = ac.concat(row_padding, identities)
+        padded_valid = ac.concat(valid_padding, validity)
+        duplicate = False
+        for index in range((SEEN_SLOTS + 7) >> 3):
+            group: ac.u16 = index
+            row = padded_rows >> (group * 176)
+            valid = padded_valid >> (group * 8)
+            hit = matching_octet(row[0:176], valid[0:8], identity)
+            duplicate = duplicate or hit
         # Widen before addition: the comparison must not wrap at 64/32 bits.
         # 先加宽再求和：地址 64 位加长度用 65 位，计数字节 32 位加长度用 33 位。
         # 例如超出最大值的求和若先截成原位宽，可能回绕成小数而错误通过范围检查。

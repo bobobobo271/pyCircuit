@@ -46,7 +46,7 @@ RAM/NoC timing. Runtime programs can address only node-local ranges.
 # 0 空闲：等待宿主装载或启动。
 # 1 取指/控制：安装配置、推进轮次、POST、WAIT、RETIRE、END，或启动 COPY。
 # 2 路由：逐节点遍历路径，检查连通树，收集所有远端目的。
-# 3 预检：扫描 40 个节点，确认目的接收范围、轮次、容量和身份。
+# 3 预检：遍历远端落点，确认目的接收范围、轮次、容量和身份。
 # 4 读：从源内存取最多 64 字节，保存到 payload。
 # 5 写：把同一份 payload 逐个写到目的；本拍结束再读下一拍。
 # 6 完成：允许宿主读回结果。7 故障：停止正常推进，允许诊断读回。
@@ -602,12 +602,13 @@ def WseMachine(host: HostRequest) -> MachineResult:
                         fault_code = 6
                         stage = 7
                     else:
-                        selected = 0
+                        selected = first_node(targets) if targets != 0 else 0
+                        frontier = targets & ~(one << selected)
                         stage = 3
                 else:
                     selected = first_node(frontier)
                     frontier = frontier & ~(one << selected)
-        # 阶段 3：依次扫描节点 0..39，预检每个远端落点。
+        # 阶段 3：按节点编号预检远端落点，复用路由遍历结束后的 frontier 保存剩余落点。
         # 确认目的配置与轮次正确、没有待处理早到项、接收范围与计数规则允许。
         # inspect 不增加接收计数。重复身份从 targets 中删除，避免重复写数据。
         # 所有目标通过后才读源载荷，避免先写一部分目的再发现其他目标有协议错误。
@@ -638,7 +639,7 @@ def WseMachine(host: HostRequest) -> MachineResult:
                     fault_code = 5
                     stage = 7
             if stage == 3:
-                if selected == 39:
+                if frontier == 0:
                     # 保留远端目标全集用于每拍动态许可检查，然后按 flags 选择是否加源本地副本。
                     # 源副本不走远端接收计数。若所有远端均重复且不需要本地副本，此 COPY 直接完成。
                     remote_mask = targets
@@ -650,7 +651,8 @@ def WseMachine(host: HostRequest) -> MachineResult:
                     else:
                         stage = 4
                 else:
-                    selected = selected + 1
+                    selected = first_node(frontier)
+                    frontier = frontier & ~(one << selected)
         # 阶段 4：从 current.src+offset 读源节点的最多 64 字节，并保存到 payload。
         # 把全部目标复制到 beat_remaining，下一阶段逐个写同一份数据。
         # 因此多播在此功能实现中是“读一次，串行写多个目的”。

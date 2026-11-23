@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -21,6 +22,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--emit-verilog", action="store_true")
+    parser.add_argument("--incremental-cpp", action="store_true",
+                        help="reuse pure values and update changed WSE register rows")
     parser.add_argument("--optimization", choices=("O0", "O1"), default="O1")
     parser.add_argument("--timeout", type=int, default=10800)
     args = parser.parse_args()
@@ -47,6 +50,9 @@ def main() -> int:
         Path(__file__).resolve(),
         ROOT / "src/wse_model/programs/abi.py",
     ]
+    incremental_tool = Path(__file__).with_name("incremental_cpp.py").resolve()
+    if args.incremental_cpp:
+        sources += [incremental_tool, incremental_tool.with_name("wse_sparse_registers.hpp")]
     receipt = {
         "status": "INCOMPLETE",
         "schema": "wse-machine-build/1",
@@ -138,11 +144,17 @@ def main() -> int:
                 "emit-" + target,
                 [compiler, "emit", final, "--target", target, "-o", output / target],
             )
+        cpp = output / "cpp"
+        if args.incremental_cpp:
+            variant = output / "incremental-cpp"
+            run("incremental-cpp", [sys.executable, incremental_tool, cpp, variant])
+            cpp = variant
+            receipt["conditions"]["incremental_cpp"] = True
         consumer = output / "consumer"
         consumer.mkdir()
         (consumer / "CMakeLists.txt").write_text(
             "cmake_minimum_required(VERSION 3.25)\nproject(WseMachine LANGUAGES C CXX)\n"
-            f'add_subdirectory("{output / "cpp"}" generated)\n'
+            f'add_subdirectory("{cpp}" generated)\n'
             f'add_executable(wse_runner "{source / "driver.cpp"}")\n'
             "target_compile_features(wse_runner PRIVATE cxx_std_20)\n"
             "target_link_libraries(wse_runner PRIVATE pycircuit_modules)\n"
