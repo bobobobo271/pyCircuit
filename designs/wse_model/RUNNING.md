@@ -39,6 +39,29 @@ python -m wse_model --json report matmul --m 1 --k 4096 --n 4096 --precision fp1
 外部载荷比较需要实际输入、输出路径；未提供时跳过该项。PyPTO 示例检查在
 设置 `AG_PYPTO_PY` 后执行输入编译。普通 Python 测试不运行 pyCircuit 电路。
 
+## FFN NoC 链路计时
+
+从 `designs/wse_model` 运行独立的行组与列组链路基准。该基准使用 pyCircuit
+6.1.0 的 SDK，已验证的 revision 为 `1817b4c6ee2f3e9c088ccbc21b186d775e50b6f2`。
+Windows 上请在提供 MSVC、CMake 和 Ninja 的 Developer PowerShell 中运行。
+
+```powershell
+$env:PYTHONPATH = Join-Path $PWD.Path 'src'
+python tools/pycircuit_allgather.py --toolchain $env:PYC_TOOLCHAIN_ROOT --nodes 40
+python tools/pycircuit_allgather.py --toolchain $env:PYC_TOOLCHAIN_ROOT --nodes 48
+```
+
+两个代表组分别测量 8 路行 AllGather 和 4 路列 AllGather。各组在源端同时就绪，
+每条单向链路每拍最多传 1 个 flit，转发优先，每跳 1 拍。脚本核对组间等价性、
+每个 flit 的有效字节与落点，以及每条有向链路的负载。`trace.jsonl`、`timing.json`
+和链接产物保存在 `.wse_model_out/pycircuit-allgather/`。
+
+40 节点基线的行相和列相分别为 225 和 721 拍，共 946 拍纯传输。加上两相各
+64 拍的 arm lead，共 1,074 拍，在 2 GHz 下为 537 ns。48 节点配置保留同样的
+32 个参与核并将 flit 头从 12 B 增至 14 B，纯传输为 970 拍，含 arm lead 为
+1,098 拍或 549 ns。这些数据只覆盖链路与声明的 arm lead，芯片端到端还需计入
+实际 CalReg 调度、跨时钟域和核侧访存。
+
 ## 共享组件回归
 
 先执行接收接口的同一 12 周期场景，C++ 与 Verilog 使用相同最终电路：
