@@ -232,10 +232,41 @@ def copy_72_bytes(name: str, src: int, dst: int, *, trailing_guard: bytes) -> Ma
     )
 
 
+def full_identity_row() -> MachineCase:
+    """Fill the last node's 56 slots, repeat slot 55, retire, then reuse its identity."""
+    payload = b"abcdefgh"
+    second = b"ABCDEFGH"
+    source, target = 38, 39
+    command = Command(
+        Kind.COPY, source=source, opcode=1, epoch=1, src=256, dst=512,
+        nbytes=8, route=(2 << 76) | (3 << 78),
+    )
+    commands = _setup((source, target)) + [_post(target, 512, 448, 448)]
+    commands.extend(replace(command, seq=i, dst=512 + 8 * i) for i in range(56))
+    commands.append(replace(commands[-1], src=264))
+    commands += _finish((target,))[:-1]
+    commands += [Command(Kind.NEXT_EPOCH, node=n, opcode=1) for n in (source, target)]
+    commands += [
+        replace(_post(target, 512, 8, 8), epoch=2),
+        replace(command, src=264, seq=55, epoch=2),
+        Command(Kind.WAIT, node=target, opcode=1, epoch=2),
+        Command(Kind.RETIRE, node=target),
+        Command(Kind.END),
+    ]
+    return MachineCase(
+        name="full-identity-row", program=Program(tuple(commands)),
+        patches=(MemoryPatch(source, 256, payload + second),),
+        readback=(MemoryRegion(target, 512, 448),),
+        expected_bytes=second + payload * 55, expected_counts={target: 8},
+        expected_traffic=(456, 456),
+    )
+
+
 def cases() -> dict[str, MachineCase]:
     result = (
         changed_group_allgather(),
         tree_copy_duplicate(),
+        full_identity_row(),
         bad_range(),
         disconnected_route(),
         # One 8-byte beat followed by a 64-byte beat ending exactly at 65536.

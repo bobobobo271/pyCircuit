@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -22,8 +21,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--emit-verilog", action="store_true")
-    parser.add_argument("--incremental-cpp", action="store_true",
-                        help="reuse pure values and update changed WSE register rows")
+    parser.add_argument("--incremental-cpp", action=argparse.BooleanOptionalAction, default=False,
+                        help="legacy register-table optimization (superseded by frontend addressing)")
     parser.add_argument("--optimization", choices=("O0", "O1"), default="O1")
     parser.add_argument("--timeout", type=int, default=10800)
     args = parser.parse_args()
@@ -37,11 +36,9 @@ def main() -> int:
     if metadata["git_sha"] != pin["revision"] or metadata["llvm_version"] != pin["llvm_mlir"]:
         raise ValueError("installed compiler/runtime must match the consumer dependency pin")
     files = [
-        (ROOT / "models/calendar", "receive_checks", "wse_calendar"),
-        (ROOT / "models/calendar", "ledger", "wse_calendar"),
-        (ROOT / "models/calendar", "control_ledger", "wse_calendar"),
-        (ROOT / "models/calendar", "control", "wse_calendar"),
         (ROOT / "models/calendar", "forward", "wse_calendar"),
+        (source, "node", "wse_machine"),
+
         (source, "machine", "wse_machine"),
     ]
     sources = [directory / f"{stem}.py" for directory, stem, _ in files]
@@ -50,9 +47,8 @@ def main() -> int:
         Path(__file__).resolve(),
         ROOT / "src/wse_model/programs/abi.py",
     ]
-    incremental_tool = Path(__file__).with_name("incremental_cpp.py").resolve()
     if args.incremental_cpp:
-        sources += [incremental_tool, incremental_tool.with_name("wse_sparse_registers.hpp")]
+        print("Using frontend-addressed node RAM. Legacy register-table rewriting is unnecessary.")
     receipt = {
         "status": "INCOMPLETE",
         "schema": "wse-machine-build/1",
@@ -68,6 +64,8 @@ def main() -> int:
             "optimization": args.optimization,
             "build_parallelism": 1,
             "simulation_workers": 1,
+            "node_storage": "frontend-addressed",
+            "incremental_cpp": False,
             "cxx": os.environ.get("CXX"),
         },
         "profile": {
@@ -145,11 +143,6 @@ def main() -> int:
                 [compiler, "emit", final, "--target", target, "-o", output / target],
             )
         cpp = output / "cpp"
-        if args.incremental_cpp:
-            variant = output / "incremental-cpp"
-            run("incremental-cpp", [sys.executable, incremental_tool, cpp, variant])
-            cpp = variant
-            receipt["conditions"]["incremental_cpp"] = True
         consumer = output / "consumer"
         consumer.mkdir()
         (consumer / "CMakeLists.txt").write_text(

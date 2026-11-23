@@ -63,9 +63,8 @@ RAM/NoC timing. Runtime programs can address only node-local ranges.
 # 这个例子说明功能先后关系；运行步数还包含取指、遍历、预检等控制开销。
 
 import pycircuit as ac
-from wse_calendar.control import CalRegLedger, CalRegRequest, EpochLedger, EpochRequest
 from wse_calendar.forward import ForwardHop, HopInput
-from wse_calendar.ledger import ReceiveLedger, Request, Segment
+from wse_machine.node import NodeContext, NodeStore
 
 
 # 宿主到机器的请求接口。字段组合是硬件输入，不是文件路径。
@@ -170,21 +169,24 @@ def first_node(mask: ac.u40) -> ac.u6:
     return ac.count_trailing_zeros(mask)
 
 
-# 从指令构造接收账本所需的元数据。Segment 是片段描述，不包含载荷字节。
-# 位宽截取在机器相应路径的完整值检查配合下使用。
-# committed=True 表示此描述按已完成片段参与账本判定；inspect 只检查，
-# 真正增加计数的 commit 在最后一个数据拍写入时调用。
-# self_sourced=False：这份描述给远端接收使用，源本地副本另走 flags 分支。
-def segment_of(command: Command) -> Segment:
-    return Segment(
-        opcode=command.opcode[0:3],
-        epoch=command.epoch[0:8],
-        address=command.dst,
-        nbytes=command.nbytes,
-        source=command.source[0:6],
-        seq=command.seq[0:16],
-        committed=True,
-        self_sourced=False,
+def parent_of(selected: ac.u6, vertical_parent: ac.u40, higher_parent: ac.u40) -> ac.u6:
+    vertical = ((vertical_parent >> selected) & 1) != 0
+    higher = ((higher_parent >> selected) & 1) != 0
+    distance: ac.u6 = 8 if vertical else 1
+    return selected + distance if higher else selected - distance
+
+
+def passing_nodes(route: ac.bits[80]) -> ac.u40:
+    # Extract each P bit with fixed wires; there is no per-node state access.
+    return ac.concat(
+        route[79:80], route[77:78], route[75:76], route[73:74], route[71:72],
+        route[69:70], route[67:68], route[65:66], route[63:64], route[61:62],
+        route[59:60], route[57:58], route[55:56], route[53:54], route[51:52],
+        route[49:50], route[47:48], route[45:46], route[43:44], route[41:42],
+        route[39:40], route[37:38], route[35:36], route[33:34], route[31:32],
+        route[29:30], route[27:28], route[25:26], route[23:24], route[21:22],
+        route[19:20], route[17:18], route[15:16], route[13:14], route[11:12],
+        route[9:10], route[7:8], route[5:6], route[3:4], route[1:2],
     )
 
 
@@ -192,6 +194,7 @@ def segment_of(command: Command) -> Segment:
 # 它把两个总是一起使用的字段组合成一个结构化接口。
 @ac.struct
 class ReadAddress:
+    enabled: bool
     node: ac.u6
     address: ac.u32
 
@@ -199,12 +202,12 @@ class ReadAddress:
 # 40 个节点各 65536 字节，总计 2621440 字节。
 # 逻辑上节点独占各自区域；实现上把它们放进一份字节存储，方便功能仿真。
 # 读/写类型 ac.bits[512] 意味着端口宽度为 64 字节，但 depth 和地址仍以字节计。
-# 例如节点 1 的地址 16，对应底层地址 1*65536+16。
+# 开头保留 64 字节供空闲读口使用。节点 1 的地址 16 对应 64+1*65536+16。
 # 读操作对齐到 64 字节边界，再选出请求起始字节；窄写用字节掩码保留邻居。
 # 共享服务方式是此功能实现的选择，不用来推断真实芯片存储端口拓扑。
 @ac.module
 def BankedMemory(request: ReadAddress) -> ac.bits[512]:
-    memory = ac.byte_mem[ac.bits[512]](depth=2621440)
+    memory = ac.byte_mem[ac.bits[512]](depth=2621504)
 
     # 自主读规则：检查节点、8 字节对齐、末地址不超过 65528。
     # 65528+8=65536，恰好读到节点区域末尾。u22 足以表示整份内存地址。
@@ -218,7 +221,8 @@ def BankedMemory(request: ReadAddress) -> ac.bits[512]:
         local: ac.u22 = request.address[0:22]
         aligned = local & 4194240
         shift: ac.u9 = request.address[0:6]
-        return memory.read((bank << 16) + aligned) >> (shift * 8)
+        read_address: ac.u22 = (bank << 16) + aligned + 64 if request.enabled else 0
+        return memory.read(read_address) >> (shift * 8)
 
     # 可调用写方法：与读规则使用相同地址布局。None 表示没有数据返回。
     # write 的实际写入随调用者事务提交；遇到断言失败不会只提交一部分效果。
@@ -229,9 +233,38 @@ def BankedMemory(request: ReadAddress) -> ac.bits[512]:
         local: ac.u22 = address[0:22]
         assert not wide or address[0:6] == 0, "wide write alignment"
         mask: ac.u64 = 18446744073709551615 if wide else 255
-        memory.write((bank << 16) + local, data, mask=mask)
+        memory.write((bank << 16) + local + 64, data, mask=mask)
 
     return load
+
+
+def invalid_copy(command: Command) -> bool:
+    source_end: ac.u33 = command.src
+    destination_end: ac.u33 = command.dst
+    source_start: ac.u33 = command.src
+    destination_start: ac.u33 = command.dst
+    length: ac.u33 = command.nbytes
+    source_end = source_end + length
+    destination_end = destination_end + length
+    overlap = (
+        source_start < destination_end
+        and destination_start < source_end
+        and command.src != command.dst
+    )
+    return (
+        command.source >= 40
+        or command.epoch == 0
+        or command.epoch > 255
+        or command.seq > 65535
+        or command.route_high > 65535
+        or command.src[0:3] != 0
+        or command.dst[0:3] != 0
+        or command.nbytes == 0
+        or command.nbytes[0:3] != 0
+        or source_end > 65536
+        or destination_end > 65536
+        or (command.flags == 1 and overlap)
+    )
 
 
 def transfer_size(source: ac.u32, target: ac.u32, remaining: ac.u32) -> ac.u32:
@@ -246,15 +279,7 @@ def WseMachine(host: HostRequest) -> MachineResult:
     # 程序内存：65536 字节 / 每条 64 字节 = 最多 1024 条指令。
     # 读一次得到整条 512 位指令；宿主可一次写整条 64 字节，也支持 8 字节窄写。
     program = ac.byte_mem[ac.bits[512]](depth=65536)
-    # 实例化子模块会给当前机器创建独立的状态。
-    # ReceiveLedger 保存 40 个接收账户、80 个早到元数据槽、2240 个去重身份槽。
-    # ROW_BITS=56*22：每个身份由 6 位源节点号和 16 位片段序号组成。
-    # EpochLedger 按节点/通信类别保存轮次；CalRegLedger 保存已安装类别的位图。
-    ledger = ReceiveLedger(
-        NODES=40, EARLY_SLOTS=2, SEEN_SLOTS=56, TOTAL_EARLY=80, TOTAL_SEEN=2240, ROW_BITS=1232
-    )
-    epochs = EpochLedger()
-    configuration = CalRegLedger()
+    nodes = NodeStore()
     # 以下带类型的模块级变量是持久状态，成功提交后保留到下一周期。
     # pc 指向下一条要执行的指令；count 是本次启动装入的实际指令数。
     pc: ac.u16 = 0
@@ -274,7 +299,7 @@ def WseMachine(host: HostRequest) -> MachineResult:
     # frontier：已发现但还没访问的路由节点；visited：已经访问的路由节点。
     # targets：本次 COPY 要落地的节点；remote_mask：最终远端目标的固定集合。
     # beat_remaining：本个数据拍还没写到的目标，会逐个清除。
-    # parents：记录路由遍历的来路，转发时排除父节点，避免立即沿原路返回。
+    # 两张位图记录路由遍历的来路，转发时据此排除父节点。
     # payload：把源读出的最多 64 字节存到跨周期状态，供后续多个目的写入复用。
     active_nodes: ac.u40 = 0
     frontier: ac.u40 = 0
@@ -282,7 +307,9 @@ def WseMachine(host: HostRequest) -> MachineResult:
     targets: ac.u40 = 0
     remote_mask: ac.u40 = 0
     beat_remaining: ac.u40 = 0
-    parents = ac.table[40, ac.u6](init=0)
+    # Two bitmaps encode the direction back to a discovered child's parent.
+    vertical_parent: ac.u40 = 0
+    higher_parent: ac.u40 = 0
     payload: ac.bits[512] = 0
     # 故障码：1 宿主请求，2 指令格式/程序越界，3 配置安装，4 推进轮次，
     # 5 接收/配置/轮次匹配，6 路由，7 COPY 参数，9 END 时接收账户仍活跃。
@@ -302,23 +329,25 @@ def WseMachine(host: HostRequest) -> MachineResult:
     host_read = host.kind == 4 and host_node_valid and host_address_valid and host_read_window
     observation_node = host.node if host_node_valid else 0
     # 选择本周期的内存读地址：优先合法宿主读，其次 stage=4 的 COPY 源读，
-    # 其他情况送安全的节点 0/地址 0。子模块的读输出供 execute 使用。
+    # 其他情况读保留的空闲行。子模块的读输出供 execute 使用。
     # 这是模块间连线选择，不是宿主在这里提前读取 Python 数组。
     memory = BankedMemory(
         ReadAddress(
+            enabled=host_read or stage == 4,
             node=host.node if host_read else current.source[0:6] if stage == 4 else 0,
             address=(host.address if host_read else current.src + offset if stage == 4 else 0),
         )
     )
     # 转发子模块一直连接 current 指令、selected 节点和该节点的父节点。
     # 主规则在 stage=2 消费其输出：能去哪些相邻节点、当前节点是否落地、是否非法。
-    # 父节点索引取模用于形成表索引；节点合法性仍由协议检查保证。
+    # 已发现节点的父方向由两张位图中的对应位给出。
+    ingress = parent_of(selected, vertical_parent, higher_parent)
     hop = ForwardHop(
         HopInput(
             route=current.route,
             node=selected,
             has_ingress=selected != current.source[0:6],
-            ingress=parents[selected % 40],
+            ingress=ingress,
         )
     )
 
@@ -331,6 +360,29 @@ def WseMachine(host: HostRequest) -> MachineResult:
         # 例如 one << 33 可以表示节点 33。
         one: ac.u40 = 1
         host_in_range = host_node_valid and host_address_valid
+        address: ac.u16 = pc
+        command = decode(program.read(address * 64))
+        # A phase issues at most one node-context operation. Payload and route
+        # phases have separate ports and do not need a context read.
+        issue = host.kind == 0 or host.kind == 5
+        owner = selected
+        need_context = False
+        if issue and stage == 1 and pc < count:
+            owner = command.source[0:6] if command.kind == 4 else command.node[0:6]
+            need_context = command.kind >= 1 and command.kind <= 6 and owner < 40
+        elif issue and stage == 3:
+            need_context = ((targets >> selected) & 1) != 0
+        elif issue and stage == 5:
+            need_context = (host.landing_permit & remote_mask) == remote_mask and (
+                offset + beat_bytes == current.nbytes and selected != current.source[0:6]
+            )
+        row = NodeContext(
+            installed=0, epochs=0, active=False, opcode=0, epoch=0, dst=0,
+            capacity=0, expected=0, counted=0, identity_count=0,
+        )
+        if need_context:
+            row = nodes.load(owner)
+        changed = False
         # 先拒绝非法宿主请求。host.node 即使在无操作时也要求落在 0..39。
         # 故障状态会保持，直到外部复位；这里没有自动清错指令。
         if (
@@ -374,8 +426,6 @@ def WseMachine(host: HostRequest) -> MachineResult:
                 fault_code = 2
                 stage = 7
             else:
-                address: ac.u16 = pc
-                command = decode(program.read(address * 64))
                 current = command
                 if command.kind == 0 or command.kind > 7 or command.flags > 1:
                     fault_code = 2
@@ -396,124 +446,73 @@ def WseMachine(host: HostRequest) -> MachineResult:
                 else:
                     node = command.node[0:6]
                     opcode = command.opcode[0:3]
-                    # 先读当前节点账户；drained 表示没有活跃账户，也没有早到元数据。
-                    # 配置安装和轮次回绕等操作需要这些旧通信状态已清空。
-                    observed = ledger.observe(node)
-                    drained = not observed.active and observed.pending == 0
-                    # INSTALL：把该 opcode 安装进节点的配置位图。
-                    # 此模块验证“配置存在且允许安装”，具体路由内容仍在 COPY 指令内。
+                    installed_bit: ac.u8 = 1
+                    installed_bit = installed_bit << opcode
+                    installed = (row.installed & installed_bit) != 0
+                    shift: ac.u8 = opcode
+                    shift = shift * 8
+                    epoch_word = row.epochs >> shift
+                    epoch = epoch_word[0:8]
                     if command.kind == 1:
-                        installed = configuration.process(
-                            node, CalRegRequest(kind=2, opcode=opcode, drained=drained)
-                        )
-                        if installed.fault:
+                        if row.active or installed:
                             fault_code = 3
                             stage = 7
                         else:
+                            row.installed = row.installed | installed_bit
+                            changed = True
                             pc = pc + 1
-                    # ADVANCE：旧接收状态排空后推进该节点/类别的 epoch（通信轮次）。
-                    # 轮次由子模块保存；这条指令成功才前进到下一条。
                     elif command.kind == 2:
-                        if not drained:
+                        if row.active:
                             fault_code = 4
                             stage = 7
                         else:
-                            epoch = epochs.process(
-                                node,
-                                EpochRequest(advance=True, opcode=opcode, drained=drained),
-                            )
-                            if epoch.fault:
-                                fault_code = 4
-                                stage = 7
-                            else:
-                                pc = pc + 1
-                    # POST：先确认类别已安装、轮次一致，接收区域在节点 64 KiB 范围内且对齐。
-                    # 用 33 位计算 dst+capacity，防止 32 位加法溢出后看似落回合法范围。
-                    # 之后才建立接收账户：目的起址、容量和本轮预期远端字节数。
+                            next_epoch: ac.u8 = 1 if epoch == 255 else epoch + 1
+                            replacement: ac.u64 = next_epoch
+                            byte_mask: ac.u64 = 255
+                            row.epochs = (row.epochs & ~(byte_mask << shift)) | (replacement << shift)
+                            changed = True
+                            pc = pc + 1
                     elif command.kind == 3:
-                        installed_post = configuration.process(
-                            node, CalRegRequest(kind=3, opcode=opcode, drained=drained)
-                        )
-                        epoch_post = epochs.process(
-                            node,
-                            EpochRequest(advance=False, opcode=opcode, drained=drained),
-                        )
                         end: ac.u33 = command.dst
                         capacity: ac.u33 = command.capacity
                         end = end + capacity
                         if (
                             command.epoch == 0
                             or command.epoch > 255
-                            or epoch_post.value != command.epoch[0:8]
-                            or installed_post.fault
+                            or epoch != command.epoch[0:8]
+                            or not installed
                             or command.dst >= 65536
                             or command.dst[0:3] != 0
                             or end > 65536
+                            or row.active
+                            or command.expected > command.capacity
+                            or command.expected != command.compiled_expected
                         ):
                             fault_code = 5
                             stage = 7
                         else:
-                            post = ledger.process(
-                                node,
-                                Request(
-                                    kind=1,
-                                    segment=segment_of(command),
-                                    capacity=command.capacity,
-                                    expected=command.expected,
-                                    compiled_expected=command.compiled_expected,
-                                ),
-                            )
-                            if post.fault or not post.accepted:
-                                fault_code = 5
-                                stage = 7
-                            else:
-                                # 账本接受 POST 后，主机器同步标记此节点有活跃上下文。
-                                active_nodes = active_nodes | (one << node)
-                                pc = pc + 1
+                            row.active = True
+                            row.opcode = opcode
+                            row.epoch = command.epoch[0:8]
+                            row.dst = command.dst
+                            row.capacity = command.capacity
+                            row.expected = command.expected
+                            row.counted = 0
+                            row.identity_count = 0
+                            changed = True
+                            active_nodes = active_nodes | (one << node)
+                            pc = pc + 1
                     # COPY：在搬运前检查整个源/目的范围、对齐、长度、身份和路由高位。
                     # flags=1 时会向源节点也写本地副本，因此额外检查源/目的区域重叠。
                     # 同址复制允许；其他部分重叠会被拒绝。加宽计算防止地址和长度求和回绕。
                     elif command.kind == 4:
-                        source_end: ac.u33 = command.src
-                        destination_end: ac.u33 = command.dst
-                        source_start: ac.u33 = command.src
-                        destination_start: ac.u33 = command.dst
-                        length: ac.u33 = command.nbytes
-                        source_end = source_end + length
-                        destination_end = destination_end + length
-                        overlap = (
-                            source_start < destination_end
-                            and destination_start < source_end
-                            and command.src != command.dst
-                        )
-                        if (
-                            command.source >= 40
-                            or command.epoch == 0
-                            or command.epoch > 255
-                            or command.seq > 65535
-                            or command.route_high > 65535
-                            or command.src[0:3] != 0
-                            or command.dst[0:3] != 0
-                            or command.nbytes == 0
-                            or command.nbytes[0:3] != 0
-                            or source_end > 65536
-                            or destination_end > 65536
-                            or (command.flags == 1 and overlap)
-                        ):
+                        if invalid_copy(command):
                             fault_code = 7
                             stage = 7
                         else:
                             # 源节点也必须安装此通信类别，且源节点当前轮次要与命令一致。
                             # 通过后清空本次遍历用的集合，选择源节点，转入 stage=2。
-                            source_admission = configuration.process(
-                                command.source[0:6],
-                                CalRegRequest(kind=3, opcode=opcode, drained=False),
-                            )
-                            source_epoch = epochs.process(
-                                command.source[0:6],
-                                EpochRequest(advance=False, opcode=opcode, drained=False),
-                            )
-                            if source_admission.fault or source_epoch.value != command.epoch[0:8]:
+                            if not installed or epoch != command.epoch[0:8]:
                                 fault_code = 5
                                 stage = 7
                             else:
@@ -527,38 +526,27 @@ def WseMachine(host: HostRequest) -> MachineResult:
                     # 未完成时既不令 pc+1，也不改变 stage；后续周期继续检查同一条指令。
                     # 此串行机器不会越过 WAIT 去执行后面的 COPY，程序本身必须安排好依赖。
                     elif command.kind == 5:
-                        epoch_wait = epochs.process(
-                            node,
-                            EpochRequest(advance=False, opcode=opcode, drained=drained),
-                        )
-                        matching = ledger.matches(node, opcode, command.epoch[0:8])
+                        matching = row.active and row.opcode == opcode and row.epoch == command.epoch[0:8]
                         if (
                             command.epoch == 0
                             or command.epoch > 255
                             or not matching
-                            or epoch_wait.value != command.epoch[0:8]
+                            or epoch != command.epoch[0:8]
                         ):
                             fault_code = 5
                             stage = 7
-                        elif observed.complete:
+                        elif row.counted >= row.expected:
                             pc = pc + 1
-                    # RETIRE：要求接收已完成，再释放账户及其去重有效位。
+                    # RETIRE：要求接收已完成，再释放账户及其去重槽。
                     # 成功时主机器也清掉 active_nodes 对应位，END 才能确认所有账户已释放。
                     elif command.kind == 6:
-                        retired = ledger.process(
-                            node,
-                            Request(
-                                kind=3,
-                                segment=segment_of(command),
-                                capacity=0,
-                                expected=0,
-                                compiled_expected=0,
-                            ),
-                        )
-                        if retired.fault:
+                        if not row.active or row.counted < row.expected:
                             fault_code = 5
                             stage = 7
                         else:
+                            row.active = False
+                            row.identity_count = 0
+                            changed = True
                             active_nodes = active_nodes & ~(one << node)
                             pc = pc + 1
         # 阶段 2：在写任何载荷前遍历完整路径，并收集远端落点。
@@ -574,24 +562,14 @@ def WseMachine(host: HostRequest) -> MachineResult:
                 visited = visited | bit
                 if hop.lands and selected != current.source[0:6]:
                     targets = targets | bit
-                collision = False
-                passing: ac.u40 = 0
-                # 这是固定界限循环：编译器把本次计算中 40 个节点的判定表示为电路。
-                # 它不是每个 peer 自动耗费一个模型周期。跨周期遍历由 selected/stage 控制。
-                # passing 汇总整张路由位图的 P 位；hop.egress 则只包含当前节点的出口。
-                for peer in range(40):
-                    peer_index: ac.u6 = peer
-                    peer_bit = one << peer_index
-                    route_offset: ac.u7 = peer_index
-                    route_pair = current.route >> (route_offset * 2)
-                    if route_pair[1:2] != 0:
-                        passing = passing | peer_bit
-                    if (hop.egress & peer_bit) != 0:
-                        if ((visited | frontier) & peer_bit) != 0:
-                            collision = True
-                        else:
-                            frontier = frontier | peer_bit
-                            parents[peer] = selected
+                collision = ((visited | frontier) & hop.egress) != 0
+                frontier = frontier | hop.egress
+                # Record the parent for all new neighbours using two word operations.
+                vertical_children = ((bit << 8) | (bit >> 8)) & hop.egress
+                lower_children = ((bit >> 1) | (bit >> 8)) & hop.egress
+                vertical_parent = (vertical_parent & ~hop.egress) | vertical_children
+                higher_parent = (higher_parent & ~hop.egress) | lower_children
+                passing = passing_nodes(current.route)
                 if collision:
                     fault_code = 6
                     stage = 7
@@ -609,35 +587,38 @@ def WseMachine(host: HostRequest) -> MachineResult:
                     selected = first_node(frontier)
                     frontier = frontier & ~(one << selected)
         # 阶段 3：按节点编号预检远端落点，复用路由遍历结束后的 frontier 保存剩余落点。
-        # 确认目的配置与轮次正确、没有待处理早到项、接收范围与计数规则允许。
-        # inspect 不增加接收计数。重复身份从 targets 中删除，避免重复写数据。
+        # 确认目的配置、轮次、接收范围与计数规则允许本次传输。
+        # 预检不增加接收计数。重复身份从 targets 中删除，避免重复写数据。
         # 所有目标通过后才读源载荷，避免先写一部分目的再发现其他目标有协议错误。
         elif stage == 3:
             target_bit = one << selected
             if (targets & target_bit) != 0:
-                receive = ledger.observe(selected)
-                admission = configuration.process(
-                    selected,
-                    CalRegRequest(kind=3, opcode=current.opcode[0:3], drained=False),
+                opcode = current.opcode[0:3]
+                epoch_shift: ac.u8 = opcode
+                epoch_word = row.epochs >> (epoch_shift * 8)
+                end: ac.u33 = current.dst
+                size: ac.u33 = current.nbytes
+                limit: ac.u33 = row.dst
+                capacity: ac.u33 = row.capacity
+                total: ac.u33 = row.counted
+                duplicate = nodes.contains(
+                    selected, row.identity_count, ac.concat(current.source[0:6], current.seq[0:16])
                 )
-                receive_epoch = epochs.process(
-                    selected,
-                    EpochRequest(advance=False, opcode=current.opcode[0:3], drained=False),
-                )
-                decision = ledger.inspect(selected, segment_of(current))
                 if (
-                    admission.fault
-                    or receive_epoch.value != current.epoch[0:8]
-                    or receive.pending != 0
-                    or decision.status == 9
+                    ((row.installed >> opcode) & 1) == 0
+                    or epoch_word[0:8] != current.epoch[0:8]
+                    or not row.active or row.opcode != opcode or row.epoch != current.epoch[0:8]
+                    or current.dst < row.dst or end + size > limit + capacity
                 ):
                     fault_code = 5
                     stage = 7
-                elif decision.status == 3:
+                elif duplicate:
                     targets = targets & ~target_bit
-                elif decision.status != 2:
+                elif total + size > capacity:
                     fault_code = 5
                     stage = 7
+                else:
+                    assert row.identity_count < 56, "WSE_MODEL_CAPACITY: dedup identity slots exhausted"
             if stage == 3:
                 if frontier == 0:
                     # 保留远端目标全集用于每拍动态许可检查，然后按 flags 选择是否加源本地副本。
@@ -672,11 +653,15 @@ def WseMachine(host: HostRequest) -> MachineResult:
                 write_increment: ac.u64 = beat_bytes
                 write_bytes = write_bytes + write_increment
                 # 只有该目的最后一个数据拍才提交整片段的身份与字节计数。
-                # 数据末拍写入和 ledger.commit 处于同一事务，成功后一起可见。
-                # 本地源副本跳过远端账本。断言要求预检成功的独占接收只被计数一次。
+                # 数据末拍写入和账户更新 处于同一事务，成功后一起可见。
+                # 本地源副本跳过远端账本。
                 if offset + beat_bytes == current.nbytes and selected != current.source[0:6]:
-                    committed = ledger.commit(selected, segment_of(current))
-                    assert committed == 2, "exclusive prepared receive commits once"
+                    # The serialized controller cannot change an admitted account
+                    # between preflight and its unique final landing.
+                    nodes.append(selected, row.identity_count, ac.concat(current.source[0:6], current.seq[0:16]))
+                    row.identity_count = row.identity_count + 1
+                    row.counted = row.counted + current.nbytes
+                    changed = True
                 # 写完一个目的清掉其位：还有目的就换 selected；本拍全写完后，
                 # 若整个片段也结束则 pc+1 回 stage=1，否则 offset+beat_bytes 回 stage=4 读下一拍。
                 beat_remaining = beat_remaining & ~(one << selected)
@@ -696,19 +681,18 @@ def WseMachine(host: HostRequest) -> MachineResult:
         if host_read:
             narrow_data: ac.bits[512] = memory[0:64]
             data = memory if host.wide else narrow_data
-        account = ledger.observe(observation_node)
-        account_epoch = ledger.epoch_of(observation_node)
+        view = nodes.publish(owner, row, changed, observation_node)
         return MachineResult(
             data=data,
             pc=pc,
             stage=stage,
             selected_node=selected,
             offset=offset,
-            counted=account.counted if host_node_valid else 0,
-            active=account.active and host_node_valid,
-            complete=account.complete and host_node_valid,
-            pending=account.pending if host_node_valid else 0,
-            epoch=account_epoch if host_node_valid else 0,
+            counted=view[0:32] if host_node_valid else 0,
+            active=view[32:33] != 0 and host_node_valid,
+            complete=view[33:34] != 0 and host_node_valid,
+            pending=0,
+            epoch=view[34:42] if host_node_valid else 0,
             fault=stage == 7,
             fault_code=fault_code,
             done=stage == 6,

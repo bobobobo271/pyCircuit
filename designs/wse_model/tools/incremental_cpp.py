@@ -146,10 +146,20 @@ def transform(source, destination):
     table_ids = {roots[row] for _, row, _ in values.values() if row is not None}
     for name, i in roots.items():
         member = name[6:]
-        support.append(f"  decltype({member}) pyc_prev_{i};\n")
         if i in table_ids:
+            # These Q pins belong to the sole register-bank writer. Consume
+            # committed changes instead of comparing all 40/80 rows each edge.
+            if name not in {
+                "this->pyc_instance_ledger->pyc_instance_accounts_q",
+                "this->pyc_instance_ledger->pyc_instance_pending_q",
+            }:
+                raise ValueError(f"unrecognized sparse register owner: {name}")
+            owner = name.removesuffix("_q") + "_state"
             support.append(f"  std::vector<std::size_t> pyc_rows_{i};\n")
-            refresh.append(f"    pyc_rows_{i}.clear();\n")
+            refresh.append(f"    {owner}->take_changed_rows(pyc_rows_{i}, pyc_refresh_all);\n")
+            refresh.append(f"    if (!pyc_rows_{i}.empty()) pyc_changed |= (1ULL << {i});\n")
+            continue
+        support.append(f"  decltype({member}) pyc_prev_{i};\n")
         refresh.append(f"""    for (std::size_t i=0; i<decltype({member})::size; ++i) {{
       const auto &now = {name}.element(i);
       auto &old = pyc_prev_{i}.element(i);
@@ -157,8 +167,6 @@ def transform(source, destination):
         old = now;
         pyc_changed |= (1ULL << {i});
 """)
-        if i in table_ids:
-            refresh.append(f"        pyc_rows_{i}.push_back(i);\n")
         refresh.append("      }\n    }\n")
     support.append("  void pyc_scan_inputs() {\n    pyc_refresh_all = !pyc_cache_valid;\n    pyc_cache_valid = false;\n    pyc_changed = 0;\n")
     support.extend(refresh)
