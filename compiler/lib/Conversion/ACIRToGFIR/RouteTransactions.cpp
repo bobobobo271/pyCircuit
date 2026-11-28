@@ -8528,7 +8528,7 @@ public:
       return;
     }
     ac::HardwareSourceCheckLimits limits;
-    limits.maxWorkUnits = 1024 * 1024;
+    limits.maxWorkUnits = 256 * 1024 * 1024;
     SourceCheckBudget budget(limits);
     auto prepared = detail::prepareTransactionLowering(input, analysis, budget);
     if (failed(prepared)) { signalPassFailure(); return; }

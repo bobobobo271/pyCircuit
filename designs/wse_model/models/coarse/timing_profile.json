@@ -1,0 +1,11 @@
+{
+  "schema": "wse-coarse-timing/1",
+  "topology": {"rows": 5, "columns": 8, "nodes": 40},
+  "time_unit": "NoC cycle (compatibility assumption: 0.5 ns)",
+  "capacity": {"active_per_source": 1, "waiting_per_source": 8, "events": 1024, "commands": 1024, "receive_bytes_per_node": 65536},
+  "link": {"wire_bytes_per_flit": 64, "payload_bytes_per_flit": 52, "service_interval": 1, "hop_latency": 1},
+  "endpoint": {"read_first": 200, "write_first": 200, "additional_beat_numerator": 10, "additional_beat_denominator": 7, "beat_bytes": 128, "transmit_crossing": 2, "receive_crossing": 2, "ejection_interval": 1},
+  "control": {"calendar_slots": 8, "slot_ticks": 1024, "alignment_plus_arm": 24, "release_guard": 1},
+  "source_status": "pending: inherited compatibility model assumptions; not silicon measurements",
+  "calendar": "The default Profile uses open source masks. Compatibility callers must supply the original per-link, per-slot source masks explicitly."
+}

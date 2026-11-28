@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wse-model"
 version = "0.1.0"
-description = "WSE architecture semantics and pyCircuit Calendar/AllGather models"
+description = "Metadata-only WSE NoC model with generated GFSIM and Verilator backends"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {file = "LICENSE"}
@@ -13,9 +13,6 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=7", "jsonschema>=4.20", "ruff==0.11.8", "black==24.10.0"]
-
-[project.scripts]
-wse-model = "wse_model.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

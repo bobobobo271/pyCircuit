@@ -1,12 +1,7 @@
 format_version: "0.2"
-project: wse-calendar
+project: wse-coarse
 roots:
-  - models/calendar/spec/*.md
   - spec/*.md
-id_prefixes: [WSEMIG]
+id_prefixes: [WSECOARSE]
 domains: [noc, verification]
 policies: {}
-dependencies:
-  ndf:
-    path: .pycircuit_out/ndf
-    graph: false

@@ -1,0 +1,43 @@
+{
+  "base_revision": "5d9ec29798020033ffa59a01e9285588e46b46d2",
+  "budget_patch_sha256": "42f1f45e6d5bcd8dc8db9683a5e30cc45c42fcd405e03dad312d726346380380",
+  "limits": {
+    "TableQuerySlots": {
+      "old": 262144,
+      "new": 67108864
+    },
+    "StateAnalysisWork": {
+      "old": 1048576,
+      "new": 268435456
+    },
+    "RouteTransactionsWork": {
+      "old": 1048576,
+      "new": 268435456
+    },
+    "HardwareSourceCheckDefault": {
+      "old": 4194304,
+      "new": 1073741824
+    }
+  },
+  "binaries": {
+    "pycircuit-link": "985b0adef7c21aeaf62396ad61b72de12223097c533f045fef387de790aa539f",
+    "pycircuit-source-unit": "a7631a3ed10325053664d21141155a3a52592c1d150a54679f99f3465e204554",
+    "pycircuit-opt": "96cc553ecfe5f2d0ce5cf1cd01268b809e9341bf2838ef67522aee5011a732bd",
+    "pycircuit-emit": "0c78c242fe88d56f7220cc76221c4c82279f33df7ac673bdc87b933692aa9a24",
+    "pycircuit": "04fb1a1e0922de5bc3196f2c0e1f8093cba43901992cf1708ababd68aaf498e1"
+  },
+  "metadata": {
+    "pyc_version": "6.1.0",
+    "git_sha": "5d9ec29798020033ffa59a01e9285588e46b46d2",
+    "platform": "Darwin",
+    "arch": "arm64",
+    "llvm_version": "22.1.8"
+  },
+  "scope": "Local tested compiler source with user-authorized temporary budget increases; not an upstream release.",
+  "compiler_source_sha256": {
+    "compiler/lib/Compiler/TableQueryLowering.cpp": "28bc0fa624a3e7b9142a3b1eeadb463a5ae516948712cb8af67e331747f3a4a0",
+    "compiler/lib/Dialect/ACIR/SourceTransactionStateAnalysis.cpp": "66b41629de6c3e0694e6f009fc7667865cd321e061f97fe7fef88b72139916dc",
+    "compiler/lib/Conversion/ACIRToGFIR/RouteTransactions.cpp": "a8b389aa46cf1a41389c55d4a10a0fb409c7cbc6b5fa39f478691bcab3005d9f",
+    "compiler/include/pycircuit/Dialect/ACIR/HardwareAnalysisContext.h": "71eed7d3e4c54a410421b847c08293d3ce97d45aaac8c25e066f7bb149737af8"
+  }
+}
