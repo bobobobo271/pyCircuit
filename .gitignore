@@ -244,3 +244,6 @@ examples/generated/**/verilator/
 /docs/reviews/
 /.omx/
 /.omx-state-locks*
+
+# Independent GFSIM dependency checkout
+/.gfsim-parallel-src/
